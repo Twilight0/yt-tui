@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="bhumi0624/ytui"
-RAW_URL="https://raw.githubusercontent.com/$REPO/main/ytui.py"
-INSTALL_DIR="$HOME/.local/share/ytui"
+REPO="Twilight0/yt-tui"
+RAW_URL="https://raw.githubusercontent.com/$REPO/main/yt_tui.py"
+INSTALL_DIR="$HOME/.local/share/yt-tui"
 BIN_DIR="$HOME/.local/bin"
-WRAPPER="$BIN_DIR/ytui"
+WRAPPER="$BIN_DIR/yt-tui"
 
 # ─── Colors ──────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
@@ -23,24 +23,24 @@ Usage: curl -sSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash
 
 Options:
   --help        Show this help
-  --uninstall   Remove YTUI and all installed files
+  --uninstall   Remove YT-TUI and all installed files
 EOF
     exit 0
 }
 
 uninstall() {
-    info "Uninstalling YTUI..."
+    info "Uninstalling YT-TUI..."
     rm -f "$WRAPPER"
     rm -rf "$INSTALL_DIR"
     for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/config.fish"; do
         if [ -f "$rc" ]; then
             cp "$rc" "$rc.bak" 2>/dev/null || true
-            sed -i '/^# Added by YTUI installer/d' "$rc"
+            sed -i '/^# Added by YT-TUI installer/d' "$rc"
             sed -i '/^export PATH="\$HOME\/.local\/bin:\$PATH"/d' "$rc"
             sed -i '/^set -gx PATH \$HOME\/.local\/bin \$PATH/d' "$rc"
         fi
     done
-    ok "YTUI has been removed."
+    ok "YT-TUI has been removed."
     exit 0
 }
 
@@ -57,7 +57,7 @@ detect_os() {
         echo "linux"
     else
         err "Unsupported OS: $(uname -s)"
-        err "Try installing via pipx instead: pipx install ytui"
+        err "Try installing via pipx instead: pipx install yt-tui"
         exit 1
     fi
 }
@@ -127,25 +127,25 @@ else
     ok "yt-dlp installed: $(yt-dlp --version 2>/dev/null || echo 'ok')"
 fi
 
-# Step 3: Download ytui.py
-info "Downloading YTUI..."
+# Step 3: Download yt_tui.py
+info "Downloading YT-TUI..."
 mkdir -p "$INSTALL_DIR"
 if command -v curl &>/dev/null; then
-    curl -sSL "$RAW_URL" -o "$INSTALL_DIR/ytui.py"
+    curl -sSL "$RAW_URL" -o "$INSTALL_DIR/yt_tui.py"
 elif command -v wget &>/dev/null; then
-    wget -q "$RAW_URL" -O "$INSTALL_DIR/ytui.py"
+    wget -q "$RAW_URL" -O "$INSTALL_DIR/yt_tui.py"
 else
     err "Neither curl nor wget found. Install one and retry."
     exit 1
 fi
-ok "Downloaded to $INSTALL_DIR/ytui.py"
+ok "Downloaded to $INSTALL_DIR/yt_tui.py"
 
 # Step 4: Create wrapper
 info "Creating wrapper script..."
 mkdir -p "$BIN_DIR"
 cat > "$WRAPPER" <<WRAPPER
 #!/usr/bin/env sh
-exec $PYTHON "$INSTALL_DIR/ytui.py" "\$@"
+exec $PYTHON "$INSTALL_DIR/yt_tui.py" "\$@"
 WRAPPER
 chmod +x "$WRAPPER"
 ok "Wrapper created at $WRAPPER"
@@ -161,7 +161,7 @@ add_to_rc() {
     [ ! -f "$file" ] && touch "$file"
     if ! grep -qxF "$line" "$file"; then
         cp "$file" "$file.bak" 2>/dev/null || true
-        printf "\n# Added by YTUI installer\n%s\n" "$line" >> "$file"
+        printf "\n# Added by YT-TUI installer\n%s\n" "$line" >> "$file"
         ADDED=true
     fi
 }
@@ -177,8 +177,8 @@ fi
 
 # ─── Done ────────────────────────────────────────────────
 echo ""
-printf "${GREEN}${BOLD}✓ YTUI installed successfully!${NC}\n"
-printf "${GREEN}Type ${BOLD}ytui${NC}${GREEN} in your terminal to run it.${NC}\n"
+printf "${GREEN}${BOLD}✓ YT-TUI installed successfully!${NC}\n"
+printf "${GREEN}Type ${BOLD}yt-tui${NC}${GREEN} in your terminal to run it.${NC}\n"
 echo ""
-printf "${CYAN}If 'ytui' is not found, restart your terminal or run:%s${NC}\n" ""
+printf "${CYAN}If 'yt-tui' is not found, restart your terminal or run:%s${NC}\n" ""
 printf "  source ~/.bashrc\n"

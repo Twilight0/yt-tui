@@ -1,4 +1,4 @@
-# ytui - YouTube Downloader TUI
+# yt-tui - YouTube Downloader TUI
 # 
 # Semua dependencies utama adalah Python standard library (curses, json, os, dll).
 # Satu-satunya dependency eksternal adalah yt-dlp (digunakan sebagai subprocess).

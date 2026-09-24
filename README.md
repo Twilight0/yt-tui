@@ -1,4 +1,4 @@
-# ytui 🎬
+# yt-tui 🎬
 
 **yt-dlp Terminal User Interface** — Download YouTube videos & playlists from your terminal with a clean curses TUI.
 
@@ -26,22 +26,22 @@
 ### One-liner (Linux / macOS / Termux)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/bhumi0624/ytui/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/Twilight0/yt-tui/main/install.sh | bash
 ```
 
-This installs yt-dlp, downloads YTUI, and sets up the `ytui` command automatically.
+This installs yt-dlp, downloads YT-TUI, and sets up the `yt-tui` command automatically.
 
 ### Windows
 
 ```bash
-pipx install ytui
+pipx install yt-tui
 ```
 
 Or install manually:
 
 ```bash
-pip install ytui
-python -m ytui
+pip install yt-tui
+python -m yt_tui
 ```
 
 ### Prerequisites
@@ -86,17 +86,17 @@ Main Menu
 ## 🗂️ Project Structure
 
 ```
-ytui/
+yt-tui/
 ├── install.sh            # One-liner installer
 ├── pyproject.toml        # Python packaging
-├── ytui.py               # Main application (single file)
+├── yt_tui.py             # Main application (single file)
 ├── requirements.txt      # Python dependencies
 └── README.md             # This file
 ```
 
-Runtime config is stored at `~/.config/ytui/`:
+Runtime config is stored at `~/.config/yt-tui/`:
 ```
-~/.config/ytui/
+~/.config/yt-tui/
 ├── config.json          # Default format, last directory, etc.
 └── history.json         # Download history
 ```

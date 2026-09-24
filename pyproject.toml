@@ -3,11 +3,11 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
-name = "ytui"
+name = "yt-tui"
 version = "1.0.1"
 description = "yt-dlp Terminal User Interface"
 requires-python = ">=3.8"
 dependencies = []
 
 [project.scripts]
-ytui = "ytui:main"
+yt-tui = "yt_tui:main"

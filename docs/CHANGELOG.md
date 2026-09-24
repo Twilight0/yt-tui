@@ -11,7 +11,7 @@
 ### Features
 
 - **Ctrl+V paste guidance** — URLInput now shows explicit Ctrl+V paste hint in status bar and instruction text.
-- **Debug logging** — URL flow is logged to `/tmp/ytui_debug.log` for troubleshooting.
+- **Debug logging** — URL flow is logged to `/tmp/yt-tui_debug.log` for troubleshooting.
 
 ### Technical
 

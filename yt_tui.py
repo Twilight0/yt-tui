@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ytui - yt-dlp Terminal User Interface
+yt-tui - yt-dlp Terminal User Interface
 Single-file curses TUI for Termux Android.
 """
 
@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Debug log
-_DEBUG_LOG = Path("/tmp/ytui_debug.log")
+_DEBUG_LOG = Path("/tmp/yt-tui_debug.log")
 
 def debug_log(msg):
     try:
@@ -28,7 +28,7 @@ def debug_log(msg):
     except Exception:
         pass
 
-CONFIG_DIR = Path.home() / ".config" / "ytui"
+CONFIG_DIR = Path.home() / ".config" / "yt-tui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 
@@ -332,7 +332,7 @@ class Screen:
 
     def draw_title(self, text):
         h, w = self.app.stdscr.getmaxyx()
-        title = f" \u2500\u2500 ytui v1.0: {text} "
+        title = f" \u2500\u2500 yt-tui v1.0: {text} "
         pad = w - len(title) - 2
         if pad < 0:
             title = title[:w - 4]
@@ -413,8 +413,8 @@ class MainMenu(Screen):
 
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
-            self.app.stdscr.addstr(4, cx("\u2500\u2500 ytui v1.0 \u2500\u2500"),
-                                   "\u2500\u2500 ytui v1.0 \u2500\u2500"[:w-2])
+            self.app.stdscr.addstr(4, cx("\u2500\u2500 yt-tui v1.0 \u2500\u2500"),
+                                   "\u2500\u2500 yt-tui v1.0 \u2500\u2500"[:w-2])
             self.app.stdscr.attroff(curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
             self.app.stdscr.attron(curses.color_pair(COLOR_TITLE))
             self.app.stdscr.addstr(5, cx("yt-dlp Terminal UI"), "yt-dlp Terminal UI"[:w-2])
@@ -1492,7 +1492,7 @@ class DownloadProgress(Screen):
             fmt_id = f"{fmt_id}+bestaudio/best"
         def run():
             try:
-                tmpl = "ytui:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_str)s|%(progress.downloaded_bytes)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
+                tmpl = "yt-tui:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_str)s|%(progress.downloaded_bytes)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
                 cmd = [
                     "yt-dlp",
                     "-f", fmt_id,
@@ -1515,7 +1515,7 @@ class DownloadProgress(Screen):
                 )
                 for line in self.proc.stdout:
                     line = line.strip()
-                    if line.startswith("ytui:"):
+                    if line.startswith("yt-tui:"):
                         parts = line[5:].split("|")
                         if len(parts) >= 5:
                             self.percent = parts[0].strip()
@@ -2581,7 +2581,7 @@ class PlaylistProgress(Screen):
         url = normalize_url(url)
         def run():
             try:
-                tmpl = "ytui:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_str)s|%(progress.downloaded_bytes)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
+                tmpl = "yt-tui:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_str)s|%(progress.downloaded_bytes)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
                 if self.mp3_mode:
                     cmd = [
                         "yt-dlp",
@@ -2618,7 +2618,7 @@ class PlaylistProgress(Screen):
                 )
                 for line in self.proc.stdout:
                     line = line.strip()
-                    if line.startswith("ytui:"):
+                    if line.startswith("yt-tui:"):
                         parts = line[5:].split("|")
                         if len(parts) >= 5:
                             # 1. Fragment-based (HLS priority)
