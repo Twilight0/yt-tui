@@ -235,6 +235,24 @@ def fmt_eta(sec_str):
         return str(sec_str)
 
 
+def fmt_dur(dur):
+    """Safe duration formatter — yt-dlp often returns None for
+    livestreams/upcoming/unavailable entries. Never raises."""
+    try:
+        if dur is None:
+            return "?:??"
+        dur = int(float(dur))
+    except (ValueError, TypeError):
+        return "?:??"
+    if dur <= 0:
+        return "?:??"
+    mins, secs = divmod(dur, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins}:{secs:02d}"
+
+
 def sanitize_filename(name, max_len=80):
     """Bersihkan string untuk jadi nama folder/file, ganti spasi dgn underscore."""
     if not name:
@@ -280,6 +298,20 @@ class Screen:
     def handle_mouse(self):
         """Handle mouse click. Override in subclass if needed."""
         pass
+
+    def needs_animation(self):
+        """Return True if screen needs periodic redraw (spinner/progress).
+        Base implementation auto-detects common busy flags so the main
+        loop doesn't have to repaint static screens at 10fps (flicker)."""
+        if getattr(self, "mode", "") == "loading":
+            return True
+        if getattr(self, "loading", False):
+            return True
+        # active download screens
+        st = getattr(self, "status", "") or getattr(self, "current_status", "")
+        if st in ("downloading", "fetching", "loading"):
+            return True
+        return False
 
     def draw_status(self, text="", color=COLOR_STATUS):
         h, w = self.app.stdscr.getmaxyx()
@@ -373,7 +405,7 @@ class MainMenu(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
 
         def cx(text):
             return w // 2 - len(text) // 2
@@ -448,7 +480,7 @@ class URLInput(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Download URL")
 
         if self.msg:
@@ -520,7 +552,7 @@ class SearchInput(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Search YouTube")
 
         if self.mode == "loading":
@@ -584,12 +616,9 @@ class SearchInput(Screen):
         for i, r in enumerate(self.results[self.offset:self.offset + max_visible]):
             y = 3 + i
             num = f"{self.offset + i + 1:>3}."
-            title = r.get('title', '?')[:48]
-            channel = r.get('channel', '?')[:18]
-            dur = r.get('duration', 0)
-            mins, secs = divmod(int(dur), 60)
-            hours, mins = divmod(mins, 60)
-            dur_str = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}" if dur else "?:??"
+            title = (r.get('title') or '?')[:48]
+            channel = (r.get('channel') or '?')[:18]
+            dur_str = fmt_dur(r.get('duration'))
             line = f" {num} {title:<50}  {channel:<20}  {dur_str:>6}"
             attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if (self.offset + i) == self.idx else curses.color_pair(COLOR_MENU)
             try:
@@ -689,11 +718,17 @@ class SearchInput(Screen):
                 search_q = self.query.strip()
                 result = subprocess.run(
                     ["yt-dlp", "--flat-playlist", "--dump-json",
-                     f"ytsearch15:{search_q}"],
-                    capture_output=True, text=True, timeout=30
+                     "--no-warnings", "--socket-timeout", "15",
+                     "--retries", "2",
+                     f"ytsearch10:{search_q}"],
+                    capture_output=True, text=True, timeout=60
                 )
                 if result.returncode != 0:
-                    self.error = result.stderr.strip()[:100]
+                    err = result.stderr.strip().splitlines()
+                    # last non-empty line is usually the real ERROR: line
+                    err_line = next((l for l in reversed(err) if l.strip()), "unknown error")[:300]
+                    self.error = err_line
+                    self.msg = f"Search failed: {err_line}"
                     self.mode = "input"
                     return
                 lines = [l for l in result.stdout.strip().split('\n') if l]
@@ -707,27 +742,31 @@ class SearchInput(Screen):
                             ch = '?'
                         self.results.append({
                             'id': d.get('id', ''),
-                            'title': d.get('title', '?'),
+                            'title': d.get('title') or '?',
                             'url': vid_url,
                             'channel': ch[:30],
-                            'duration': d.get('duration', 0),
-                            'views': d.get('view_count', 0),
+                            'duration': d.get('duration') or 0,
+                            'views': d.get('view_count') or 0,
                         })
                     except json.JSONDecodeError:
                         continue
                 if not self.results:
                     self.error = "No results found"
+                    self.msg = "No results found. Try different keywords or paste a URL directly."
                     self.mode = "input"
                 else:
                     self.mode = "results"
             except subprocess.TimeoutExpired:
-                self.error = "Search timed out after 30s"
+                self.error = "Search timed out after 60s (slow network?)"
+                self.msg = "Search timed out after 60s. Retry or paste a URL directly."
                 self.mode = "input"
             except FileNotFoundError:
                 self.error = "yt-dlp not found! Install with: pkg install yt-dlp"
+                self.msg = "yt-dlp not found! Install with: pkg install yt-dlp"
                 self.mode = "input"
             except Exception as e:
-                self.error = str(e)[:100]
+                self.error = str(e)[:300]
+                self.msg = f"Search failed: {self.error}"
                 self.mode = "input"
 
         threading.Thread(target=run, daemon=True).start()
@@ -807,9 +846,9 @@ class FormatSelector(Screen):
                     })
                 self.formats = parsed
                 self.video_info = {
-                    "title": data.get("title", "Unknown"),
-                    "duration": data.get("duration", 0),
-                    "uploader": data.get("uploader", ""),
+                    "title": data.get("title", "Unknown") or "Unknown",
+                    "duration": data.get("duration") or 0,
+                    "uploader": data.get("uploader", "") or "",
                     "playlist_count": data.get("playlist_count"),
                     "playlist": data.get("playlist"),
                 }
@@ -828,7 +867,7 @@ class FormatSelector(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         if self.preset_mode:
             self._render_preset_overlay(h, w)
             return
@@ -847,11 +886,14 @@ class FormatSelector(Screen):
             return
 
         info = self.video_info
-        title = info.get("title", "Unknown")
-        duration = info.get("duration", 0)
-        mins, secs = divmod(int(duration), 60)
+        title = info.get("title", "Unknown") or "Unknown"
+        dur_str = fmt_dur(info.get("duration"))
+        try:
+            duration = int(float(info.get("duration") or 0))
+        except (ValueError, TypeError):
+            duration = 0
+        mins, secs = divmod(duration, 60)
         hours, mins = divmod(mins, 60)
-        dur_str = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
 
         self.draw_title(f"Select Format - {title[:50]}")
 
@@ -1018,7 +1060,7 @@ class SubtitleSelector(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Subtitle Options")
 
         if not self.items:
@@ -1163,7 +1205,7 @@ class FolderBrowser(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Select Download Directory")
 
         path_display = self.current_path[: w - 4]
@@ -1430,7 +1472,7 @@ class DownloadProgress(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Downloading...")
 
         try:
@@ -1576,7 +1618,7 @@ class HistoryView(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Download History")
 
         entries = self.app.history.entries
@@ -1672,7 +1714,7 @@ class BatchDownload(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Batch Download")
 
         if self.mode == "select":
@@ -1796,7 +1838,7 @@ class BatchConfirm(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Batch Download")
 
         try:
@@ -1864,7 +1906,7 @@ class BatchFormatPick(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Select Format for Batch")
 
         lines = [
@@ -1952,7 +1994,7 @@ class BatchProgress(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Batch Download Progress")
 
         if self.error:
@@ -2060,8 +2102,8 @@ class PlaylistDetect(Screen):
                         vid_url = normalize_url(vid_url)
                         videos.append({
                             'id': d.get('id', ''),
-                            'title': d.get('title', '?'),
-                            'duration': d.get('duration', 0),
+                            'title': d.get('title') or '?',
+                            'duration': d.get('duration') or 0,
                             'url': vid_url,
                         })
                     self.playlist_data = {
@@ -2083,7 +2125,7 @@ class PlaylistDetect(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Checking URL...")
         if self.loading:
             try:
@@ -2135,14 +2177,14 @@ class PlaylistOverview(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Playlist Detected")
 
         d = self.pl_data
-        title = d.get('title', 'Playlist')[:w-6]
-        uploader = d.get('uploader', '')[:30]
-        count = d.get('count', 0)
-        total_dur = sum(v.get('duration', 0) for v in d.get('videos', []))
+        title = (d.get('title') or 'Playlist')[:w-6]
+        uploader = (d.get('uploader') or '')[:30]
+        count = d.get('count', 0) or 0
+        total_dur = sum((v.get('duration') or 0) for v in d.get('videos', []))
         hours, rem = divmod(total_dur, 3600)
         mins, secs = divmod(rem, 60)
         dur_str = f"{hours}h {mins}m" if hours else f"{mins}m {secs}s"
@@ -2298,7 +2340,7 @@ class PlaylistSelector(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Select Videos")
 
         pl_title = self.pl_data.get('title', 'Playlist')[:w-6]
@@ -2327,10 +2369,8 @@ class PlaylistSelector(Screen):
             y = 4 + i
             sel = self.selected[self.offset + i]
             checkbox = "[x]" if sel else "[ ]"
-            title = v.get('title', '?')[:48]
-            dur = v.get('duration', 0)
-            mins, secs = divmod(int(dur), 60)
-            dur_str = f"{mins}:{secs:02d}" if dur else "?:??"
+            title = (v.get('title') or '?')[:48]
+            dur_str = fmt_dur(v.get('duration'))
             line = f" {checkbox}  {title:<50}  {dur_str:<6}"
             is_sel = (self.offset + i) == self.idx
             if is_sel:
@@ -2541,7 +2581,7 @@ class PlaylistProgress(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Playlist Download")
 
         # Overall progress
@@ -2683,7 +2723,7 @@ class SettingsView(Screen):
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Settings")
 
         for i, field in enumerate(self.fields):
@@ -2775,7 +2815,7 @@ class SettingsView(Screen):
 class HelpScreen(Screen):
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
-        self.app.stdscr.clear()
+        self.app.stdscr.erase()
         self.draw_title("Help — Keyboard Shortcuts")
 
         sections = [
@@ -2878,7 +2918,7 @@ class App:
         # Redraw current screen on next frame
         if self.screens:
             try:
-                self.stdscr.clear()
+                self.stdscr.erase()
                 self.stdscr.refresh()
             except curses.error:
                 pass
@@ -2900,23 +2940,70 @@ class App:
             self.running = False
 
     def run(self):
-        self.stdscr.timeout(100)  # 100ms timeout → ~10fps refresh tanpa perlu input
+        self.stdscr.timeout(100)  # 100ms timeout for responsive input
+        # Initial paint
+        try:
+            self.screens[-1].render()
+            self.stdscr.refresh()
+        except curses.error:
+            pass
+        last_id = id(self.screens[-1]) if self.screens else None
+        last_state = self._screen_state(self.screens[-1]) if self.screens else None
         while self.running:
             try:
                 screen = self.screens[-1]
-                screen.render()
-                self.stdscr.refresh()
-                self.spinner_count += 1
                 key = self.stdscr.getch()
-                if key != -1:  # -1 = timeout, tidak ada tombol ditekan
+                if key != -1:  # key pressed: handle + repaint
                     if key == curses.KEY_MOUSE:
                         screen.handle_mouse()
                     else:
                         screen.handle_key(key)
+                    # screen may have changed after key handling
+                    screen = self.screens[-1] if self.screens else screen
+                    try:
+                        screen.render()
+                        self.stdscr.refresh()
+                    except curses.error:
+                        pass
+                    last_id = id(screen)
+                    last_state = self._screen_state(screen)
+                else:
+                    cur_state = self._screen_state(screen)
+                    # Repaint if: screen pushed/popped, busy-mode changed
+                    # (background thread finished search/fetch), or active
+                    # spinner/progress needs its tick. Otherwise stay still
+                    # to avoid the 10fps full-clear flicker on Termux.
+                    if id(screen) != last_id or cur_state != last_state:
+                        try:
+                            screen.render()
+                            self.stdscr.refresh()
+                        except curses.error:
+                            pass
+                        last_id = id(screen)
+                        last_state = cur_state
+                    elif screen.needs_animation():
+                        try:
+                            screen.render()
+                            self.stdscr.refresh()
+                        except curses.error:
+                            pass
+                        self.spinner_count += 1
+                # idle static screen + no key + no change: do nothing
             except KeyboardInterrupt:
                 self.running = False
             except curses.error:
                 pass
+
+    def _screen_state(self, screen):
+        """Cheap snapshot to detect background-thread state changes."""
+        return (
+            getattr(screen, "mode", None),
+            getattr(screen, "loading", None),
+            getattr(screen, "status", None) or getattr(screen, "current_status", None),
+            len(getattr(screen, "results", []) or []),
+            getattr(screen, "msg", None),
+            getattr(screen, "error", None),
+        )
 
 
 def main():
