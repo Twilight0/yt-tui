@@ -73,6 +73,7 @@ Main Menu
 | `m` | Toggle MP3 mode |
 | `Space` | Toggle select (playlist selector) |
 | `Tab` / `t` | Switch videos / playlists (search results) |
+| `p` | Play highlighted video/playlist (search results) |
 | `PgUp` / `PgDn` | Page through results |
 | `a` / `n` | Select all / none (playlist selector) |
 | `n` | Create new folder (folder browser) |
