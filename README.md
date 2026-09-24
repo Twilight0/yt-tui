@@ -72,6 +72,8 @@ Main Menu
 | `d` | Download (at format/folder/playlist screens) |
 | `m` | Toggle MP3 mode |
 | `Space` | Toggle select (playlist selector) |
+| `Tab` / `t` | Switch videos / playlists (search results) |
+| `PgUp` / `PgDn` | Page through results |
 | `a` / `n` | Select all / none (playlist selector) |
 | `n` | Create new folder (folder browser) |
 | `Ctrl+V` | Paste URL from clipboard (recommended over long-press paste) |

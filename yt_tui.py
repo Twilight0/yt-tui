@@ -542,7 +542,7 @@ class URLInput(Screen):
 class SearchInput(Screen):
     """Search YouTube videos + playlists via yt-dlp and pick from results."""
     SEARCH_LIMIT = 30
-    VIEWS = ("all", "videos", "playlists")
+    MAX_BATCHES = 4  # initial + 3x load-more = up to 120 per kind
 
     def __init__(self, app):
         super().__init__(app)
@@ -551,24 +551,41 @@ class SearchInput(Screen):
         self.idx = 0
         self.offset = 0
         self.mode = "input"  # "input" | "loading" | "results"
-        self.view = "all"  # "all" | "videos" | "playlists"
+        self.view = "videos"  # "videos" | "playlists" (Tab toggles)
+        self.more_videos = False  # another video batch available?
+        self.more_playlists = False  # another playlist batch available?
+        self.loading_more = False  # load-more fetch in flight?
+        self.load_err = ""  # last load-more error (shown in stats line)
         self.error = ""
         self.msg = ""
 
     def visible(self):
-        """Results filtered by current view (all/videos/playlists)."""
-        if self.view == "videos":
-            return [r for r in self.results if r.get("kind") != "playlist"]
+        """Results for the current view (videos or playlists)."""
         if self.view == "playlists":
             return [r for r in self.results if r.get("kind") == "playlist"]
-        return self.results
+        return [r for r in self.results if r.get("kind") != "playlist"]
 
-    def cycle_view(self):
-        """Cycle All -> Videos -> Playlists -> All, reset cursor."""
-        i = self.VIEWS.index(self.view)
-        self.view = self.VIEWS[(i + 1) % len(self.VIEWS)]
+    def has_more(self):
+        """Whether the current view offers another batch."""
+        if self.view == "playlists":
+            return self.more_playlists
+        return self.more_videos
+
+    def toggle_view(self):
+        """Flip Videos <-> Playlists, reset cursor."""
+        self.view = "playlists" if self.view == "videos" else "videos"
         self.idx = 0
         self.offset = 0
+        self.load_err = ""
+
+    def needs_animation(self):
+        if self.loading_more:
+            return True
+        return super().needs_animation()
+
+    def cycle_view(self):
+        """Legacy alias for toggle_view."""
+        self.toggle_view()
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
@@ -613,23 +630,26 @@ class SearchInput(Screen):
 
     def _render_results(self, h, w):
         items = self.visible()
-        # keep cursor inside filtered list
-        if self.idx >= len(items):
-            self.idx = max(0, len(items) - 1)
-        view_label = {"all": "All", "videos": "Videos",
-                      "playlists": "Playlists"}[self.view]
+        show_more = self.has_more()
+        n_rows = len(items) + (1 if show_more else 0)
+        # keep cursor inside rows (items + optional Load-more button)
+        if n_rows == 0:
+            self.idx = 0
+        elif self.idx >= n_rows:
+            self.idx = n_rows - 1
+        view_label = "Videos" if self.view == "videos" else "Playlists"
         nv = sum(1 for r in self.results if r.get("kind") != "playlist")
         np = sum(1 for r in self.results if r.get("kind") == "playlist")
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
             self.app.stdscr.addstr(
                 1, 0,
-                f" Results for: {self.query[:w-40]} [{view_label}] ({nv}V+{np}P)"[:w-1])
+                f" Results for: {self.query[:w-40]} [{view_label}] ({nv}V/{np}P, Tab to switch)"[:w-1])
             self.app.stdscr.attroff(curses.color_pair(COLOR_INFO))
         except curses.error:
             pass
 
-        header = f"{'':4}{'':4}{'Title':<46}  {'Channel':<18}  {'Dur':6}"
+        header = f"{'':4}{'Title':<50}  {'Channel':<20}  {'Dur':6}"
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
             self.app.stdscr.addstr(2, 0, header[:w - 1])
@@ -643,15 +663,29 @@ class SearchInput(Screen):
         if self.idx >= self.offset + max_visible:
             self.offset = self.idx - max_visible + 1
 
-        for i, r in enumerate(items[self.offset:self.offset + max_visible]):
-            y = 3 + i
-            num = f"{self.offset + i + 1:>3}."
-            tag = "[P]" if r.get("kind") == "playlist" else "[V]"
-            title = (r.get('title') or '?')[:44]
-            channel = (r.get('channel') or '?')[:16]
-            dur_str = fmt_dur(r.get('duration'))
-            line = f" {num} {tag} {title:<46}  {channel:<18}  {dur_str:>6}"
-            attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if (self.offset + i) == self.idx else curses.color_pair(COLOR_MENU)
+        for n in range(self.offset, min(self.offset + max_visible, n_rows)):
+            y = 3 + n - self.offset
+            is_sel = (n == self.idx)
+            attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if is_sel \
+                else curses.color_pair(COLOR_MENU)
+            if n < len(items):
+                r = items[n]
+                num = f"{n + 1:>3}."
+                title = (r.get('title') or '?')[:48]
+                channel = (r.get('channel') or '?')[:18]
+                dur_str = fmt_dur(r.get('duration'))
+                line = f" {num} {title:<50}  {channel:<20}  {dur_str:>6}"
+            else:
+                # Load-more button row
+                if self.loading_more:
+                    line = (f"      {SPINNER_FRAMES[self.app.spinner_count % 10]}"
+                            f" Loading more {view_label.lower()}... ")
+                elif self.load_err:
+                    line = (f"      >> Load failed: {self.load_err[:w-24]}"
+                            f" — Enter to retry ")
+                else:
+                    line = (f"      >> Load more {view_label.lower()} "
+                            f"({len(items)} shown) — Enter ")
             try:
                 self.app.stdscr.attron(attr)
                 self.app.stdscr.addstr(y, 0, line[:w - 1])
@@ -661,16 +695,17 @@ class SearchInput(Screen):
 
         # Stats + pagination
         total = len(items)
-        if total == 0:
-            stats = f" No {view_label.lower()} found — press t to change filter "
-            page_str = ""
+        if total == 0 and not show_more:
+            stats = f" No {view_label.lower()} — press Tab for {'videos' if self.view == 'playlists' else 'playlists'} "
         else:
-            pages = (total + max_visible - 1) // max_visible
+            pages = (n_rows + max_visible - 1) // max_visible
             cur_page = self.offset // max_visible + 1
             page_str = f"  Page {cur_page}/{pages}" if pages > 1 else ""
-            stats = (f" {total} {view_label.lower()}  "
-                     f"showing {self.offset + 1}-{min(self.offset + max_visible, total)}"
+            stats = (f" {total} {view_label.lower()}{'+' if show_more else ''}  "
+                     f"showing {self.offset + 1}-{min(self.offset + max_visible, n_rows)}"
                      f"{page_str}")
+            if self.load_err and not self.loading_more:
+                stats = f" {self.load_err[:w-6]}"
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
             self.app.stdscr.addstr(h - 3, 2, stats[:w - 4])
@@ -683,7 +718,7 @@ class SearchInput(Screen):
             self.draw_status("Press Esc to go back")
             return
 
-        self.draw_status("↑/↓ move  PgUp/PgDn page  t filter V/P  Enter select  n new  Esc back")
+        self.draw_status("↑/↓ move  PgUp/PgDn page  Tab videos/playlists  Enter select  n new  Esc back")
 
     def handle_key(self, key):
         if self.mode == "loading":
@@ -729,37 +764,46 @@ class SearchInput(Screen):
         h, _w = self.app.stdscr.getmaxyx()
         page = max(1, h - 6)
         items = self.visible()
+        n_rows = len(items) + (1 if self.has_more() else 0)
         if key == 27:
             self.mode = "input"
             self.msg = ""
             self.query = ""
-            self.view = "all"
+            self.view = "videos"
+            self.load_err = ""
         elif key in (ord("n"), ord("N")):
             self.mode = "input"
             self.query = ""
             self.results = []
-            self.view = "all"
+            self.view = "videos"
             self.msg = ""
-        elif key in (ord("t"), ord("T"), 9):  # t / Tab: cycle All/Videos/Playlists
-            self.cycle_view()
+            self.load_err = ""
+            self.more_videos = False
+            self.more_playlists = False
+        elif key in (ord("t"), ord("T"), 9):  # t / Tab: Videos <-> Playlists
+            self.toggle_view()
         elif key == curses.KEY_UP:
             self.idx = max(0, self.idx - 1)
         elif key == curses.KEY_DOWN:
-            self.idx = min(max(0, len(items) - 1), self.idx + 1)
+            self.idx = min(max(0, n_rows - 1), self.idx + 1)
         elif key == curses.KEY_NPAGE:  # PageDown
-            self.idx = min(max(0, len(items) - 1), self.idx + page)
+            self.idx = min(max(0, n_rows - 1), self.idx + page)
         elif key == curses.KEY_PPAGE:  # PageUp
             self.idx = max(0, self.idx - page)
         elif key == curses.KEY_HOME:
             self.idx = 0
         elif key == curses.KEY_END:
-            self.idx = max(0, len(items) - 1)
+            self.idx = max(0, n_rows - 1)
         elif key in (curses.KEY_ENTER, 10, 13):
-            if items and 0 <= self.idx < len(items):
+            if self.loading_more:
+                return
+            if n_rows and 0 <= self.idx < len(items):
                 selected = items[self.idx]
                 url = selected.get('url', '')
                 if url:
                     self.app.push_screen(FormatSelector(self.app, url))
+            elif self.has_more() and self.idx == len(items):
+                self._load_more()
 
     def _do_search(self):
         self.mode = "loading"
@@ -767,81 +811,25 @@ class SearchInput(Screen):
         self.results = []
         self.idx = 0
         self.offset = 0
-        self.view = "all"
-
-        def fetch_json(args, timeout):
-            """Run yt-dlp, return (entries, error_line)."""
-            try:
-                result = subprocess.run(
-                    args, capture_output=True, text=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                return [], "timed out"
-            if result.returncode != 0:
-                err = result.stderr.strip().splitlines()
-                line = next((l for l in reversed(err) if l.strip()),
-                            "unknown error")[:300]
-                return [], line
-            entries = []
-            for line in result.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            return entries, ""
+        self.view = "videos"
+        self.more_videos = False
+        self.more_playlists = False
+        self.loading_more = False
+        self.load_err = ""
 
         def run():
             try:
                 search_q = self.query.strip()
                 limit = self.SEARCH_LIMIT
-                base = ["yt-dlp", "--flat-playlist", "--dump-json",
-                        "--no-warnings", "--socket-timeout", "15",
-                        "--retries", "2"]
-                # 1) videos via ytsearch (videos only)
-                vids, vid_err = fetch_json(
-                    base + [f"ytsearch{limit}:{search_q}"], timeout=60)
-                # 2) playlists via YouTube playlist-filter search page
-                pl_url = ("https://www.youtube.com/results?search_query="
-                          + urllib.parse.quote(search_q)
-                          + "&sp=EgIQAw%253D%253D")
-                pls, pl_err = fetch_json(
-                    base + ["--playlist-end", str(limit), pl_url],
-                    timeout=60)
-
+                vids, vid_err = self._fetch_videos(search_q, limit)
+                pls, pl_err = self._fetch_playlists(search_q, 1, limit)
                 for d in vids:
-                    vid_url = d.get('original_url') or d.get('webpage_url') or \
-                        f"https://youtube.com/watch?v={d.get('id', '')}"
-                    ch = d.get('channel') or d.get('uploader') or \
-                        d.get('channel_url') or '?'
-                    if ch and ch.startswith('http'):
-                        ch = '?'
-                    self.results.append({
-                        'id': d.get('id', ''),
-                        'title': d.get('title') or '?',
-                        'url': vid_url,
-                        'channel': ch[:30],
-                        'duration': d.get('duration') or 0,
-                        'views': d.get('view_count') or 0,
-                        'kind': 'video',
-                    })
+                    self.results.append(self._parse_video(d))
                 for d in pls:
-                    pid = d.get('id', '')
-                    pl_link = d.get('original_url') or d.get('webpage_url') or \
-                        f"https://www.youtube.com/playlist?list={pid}"
-                    ch = d.get('channel') or d.get('uploader') or \
-                        d.get('channel_url') or '?'
-                    if ch and ch.startswith('http'):
-                        ch = '?'
-                    self.results.append({
-                        'id': pid,
-                        'title': d.get('title') or '?',
-                        'url': pl_link,
-                        'channel': ch[:30],
-                        'duration': d.get('duration') or 0,
-                        'views': d.get('view_count') or 0,
-                        'kind': 'playlist',
-                    })
+                    self.results.append(self._parse_playlist(d))
+                # A full batch hints at more; a short batch means exhausted.
+                self.more_videos = len(vids) >= limit and not vid_err
+                self.more_playlists = len(pls) >= limit and not pl_err
                 if not self.results:
                     detail = vid_err or pl_err or "no data"
                     self.error = f"No results found ({detail})"
@@ -860,6 +848,140 @@ class SearchInput(Screen):
                 self.mode = "input"
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _load_more(self):
+        """Fetch the next batch for the current view (Load-more button)."""
+        if self.loading_more or not self.has_more():
+            return
+        self.loading_more = True
+        self.load_err = ""
+        search_q = self.query.strip()
+        view = self.view
+        known = {r.get("id") for r in self.results}
+
+        def run():
+            try:
+                if view == "playlists":
+                    start = sum(1 for r in self.results
+                                if r.get("kind") == "playlist") + 1
+                    entries, err = self._fetch_playlists(
+                        search_q, start, start + self.SEARCH_LIMIT - 1)
+                    fresh = [d for d in entries if d.get("id") not in known]
+                    for d in fresh:
+                        self.results.append(self._parse_playlist(d))
+                    # Short batch (or error) = exhausted -> hide button.
+                    if err or len(entries) < self.SEARCH_LIMIT:
+                        self.more_playlists = False
+                else:
+                    want = (sum(1 for r in self.results
+                                if r.get("kind") != "playlist")
+                            + self.SEARCH_LIMIT)
+                    if want > self.SEARCH_LIMIT * self.MAX_BATCHES:
+                        self.more_videos = False
+                        self.load_err = "result cap reached"
+                    else:
+                        entries, err = self._fetch_videos(search_q, want)
+                        fresh = [d for d in entries
+                                 if d.get("id") not in known]
+                        for d in fresh:
+                            self.results.append(self._parse_video(d))
+                        if err or not fresh:
+                            self.more_videos = False
+                            if err:
+                                self.load_err = err[:80]
+                # keep cursor on the button/first-new area
+                if view == self.view:
+                    self.idx = min(self.idx, len(self.visible())
+                                   + (1 if self.has_more() else 0) - 1)
+            except FileNotFoundError:
+                self.load_err = "yt-dlp not found"
+            except Exception as e:
+                self.load_err = str(e)[:80]
+            finally:
+                self.loading_more = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _base_args():
+        return ["yt-dlp", "--flat-playlist", "--dump-json",
+                "--no-warnings", "--socket-timeout", "15",
+                "--retries", "2"]
+
+    @staticmethod
+    def _pl_url(search_q):
+        return ("https://www.youtube.com/results?search_query="
+                + urllib.parse.quote(search_q)
+                + "&sp=EgIQAw%253D%253D")
+
+    def _fetch_json(self, args, timeout):
+        """Run yt-dlp, return (entries, error_line)."""
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return [], "timed out"
+        if result.returncode != 0:
+            err = result.stderr.strip().splitlines()
+            line = next((l for l in reversed(err) if l.strip()),
+                        "unknown error")[:300]
+            return [], line
+        entries = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return entries, ""
+
+    def _fetch_videos(self, search_q, limit):
+        return self._fetch_json(
+            self._base_args() + [f"ytsearch{limit}:{search_q}"],
+            timeout=60)
+
+    def _fetch_playlists(self, search_q, start, end):
+        return self._fetch_json(
+            self._base_args() + ["--playlist-start", str(start),
+                                 "--playlist-end", str(end),
+                                 self._pl_url(search_q)],
+            timeout=60)
+
+    @staticmethod
+    def _channel(d):
+        ch = d.get('channel') or d.get('uploader') or \
+            d.get('channel_url') or '?'
+        if ch and ch.startswith('http'):
+            ch = '?'
+        return ch[:30]
+
+    def _parse_video(self, d):
+        vid_url = d.get('original_url') or d.get('webpage_url') or \
+            f"https://youtube.com/watch?v={d.get('id', '')}"
+        return {
+            'id': d.get('id', ''),
+            'title': d.get('title') or '?',
+            'url': vid_url,
+            'channel': self._channel(d),
+            'duration': d.get('duration') or 0,
+            'views': d.get('view_count') or 0,
+            'kind': 'video',
+        }
+
+    def _parse_playlist(self, d):
+        pid = d.get('id', '')
+        pl_link = d.get('original_url') or d.get('webpage_url') or \
+            f"https://www.youtube.com/playlist?list={pid}"
+        return {
+            'id': pid,
+            'title': d.get('title') or '?',
+            'url': pl_link,
+            'channel': self._channel(d),
+            'duration': d.get('duration') or 0,
+            'views': d.get('view_count') or 0,
+            'kind': 'playlist',
+        }
 
 
 class FormatSelector(Screen):
@@ -3089,10 +3211,12 @@ class App:
         return (
             getattr(screen, "mode", None),
             getattr(screen, "loading", None),
+            getattr(screen, "loading_more", None),
             getattr(screen, "status", None) or getattr(screen, "current_status", None),
             len(getattr(screen, "results", []) or []),
             getattr(screen, "msg", None),
             getattr(screen, "error", None),
+            getattr(screen, "view", None),
         )
 
 
