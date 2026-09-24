@@ -64,23 +64,95 @@ Main Menu
 
 ### Controls
 
+Keys are context-dependent — the same key can do different things on
+different screens (`p`, `t`, `d`, `n` and `q` in particular).
+
+**Main menu**
+
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate |
 | `Enter` | Confirm / Enter |
-| `Esc` | Go back |
-| `d` | Download (at format/folder/playlist screens) |
-| `m` | Toggle MP3 mode |
-| `Space` | Toggle select (playlist selector) |
-| `Tab` / `t` | Switch videos / playlists (search results) |
-| `p` | Play highlighted video/playlist (search results) |
-| `PgUp` / `PgDn` | Page through results |
-| `a` / `n` | Select all / none (playlist selector) |
-| `n` | Create new folder (folder browser) |
+| `?` | Help |
+| `t` | Toggle dark/light theme |
+| `q` / `Esc` | Quit |
+
+**Search**
+
+| Key | Action |
+|-----|--------|
+| type, `Backspace` | Query text |
+| `Enter` | Start search |
 | `Ctrl+V` | Paste URL from clipboard (recommended over long-press paste) |
 | `Ctrl+U` | Clear input field |
-| `q` | Quit / Cancel download |
-| `?` | Show help (at main menu) |
+| `Esc` | Go back |
+
+**Search results**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn`, `Home` / `End` | Page / jump to ends |
+| `Tab` / `t` | Flip Videos ↔ Playlists |
+| `p` | Play highlighted item (termux-open / xdg-open / open / startfile) |
+| `Enter` | Open details — or Load-more on the `>>` row |
+| `n` | New search |
+| `Esc` | Back |
+
+**Format list**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate |
+| `Enter` / `d` | Select format (download) |
+| `p` | Quality presets (⚠️ different `p` than on search results) |
+| `r` | Refresh formats |
+| `Esc` | Go back |
+
+**Subtitles**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓`, `←` / `→` / `Tab` | Move, switch manual/auto column |
+| `Space` | Toggle language |
+| `a` / `n` | All / none |
+| `Enter` | Confirm, `Esc` skip |
+
+**Download folder**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓`, `Enter` | Browse directories |
+| `n` | Create new folder |
+| `d` | Download here |
+| `Esc` | Back |
+
+**Download progress**
+
+| Key | Action |
+|-----|--------|
+| `q` | Cancel download |
+| after done: `n` / `h` / `q` / `Esc` | New download / home / quit / back |
+
+**History**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate |
+| `r` | Re-download entry |
+| `d` | Delete entry |
+| `C` (shift) | Clear all history |
+| `Esc` | Back |
+
+**Playlist**
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓`, `Enter` | Choose Download-all / Select / Range |
+| `m` | MP3 mode toggle |
+| picker: `Space`, `a` (toggle all), `n` (none), `d` | Select videos, download |
+| range: type `1,3,5-10`, `Enter` | Range download |
+| `Esc` | Back |
 
 > **Note:** Use `Ctrl+V` to paste URLs instead of long-press paste. Long-press paste can drop special characters like `?` in some terminal emulators. `Ctrl+V` reads the clipboard directly via Android API (requires `termux-api` on Termux).
 
