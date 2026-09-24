@@ -7,6 +7,7 @@ Single-file curses TUI for Termux Android.
 import curses
 import json
 import os
+import platform
 import re
 import signal
 import shutil
@@ -252,6 +253,34 @@ def fmt_dur(dur):
     if hours:
         return f"{hours}:{mins:02d}:{secs:02d}"
     return f"{mins}:{secs:02d}"
+
+
+def play_media(url):
+    """Open url with the platform's default handler.
+
+    Android/Termux -> termux-open, Windows -> os.startfile,
+    macOS -> open, Linux/other -> xdg-open.
+    Returns (ok, message). Never raises."""
+    try:
+        if not url:
+            return False, "nothing to play"
+        # Termux reports Linux, so check its opener first.
+        if shutil.which("termux-open"):
+            subprocess.Popen(["termux-open", url])
+            return True, "Opening with termux-open…"
+        sysname = platform.system()
+        if sysname == "Windows":
+            os.startfile(url)
+            return True, "Opening…"
+        if sysname == "Darwin":
+            subprocess.Popen(["open", url])
+            return True, "Opening…"
+        if shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", url])
+            return True, "Opening with xdg-open…"
+        return False, "no opener found (need termux-open or xdg-open)"
+    except Exception as e:
+        return False, str(e)[:100]
 
 
 def sanitize_filename(name, max_len=80):
@@ -556,6 +585,7 @@ class SearchInput(Screen):
         self.more_playlists = False  # another playlist batch available?
         self.loading_more = False  # load-more fetch in flight?
         self.load_err = ""  # last load-more error (shown in stats line)
+        self.play_msg = ""  # last play feedback (shown in stats line)
         self.error = ""
         self.msg = ""
 
@@ -577,6 +607,7 @@ class SearchInput(Screen):
         self.idx = 0
         self.offset = 0
         self.load_err = ""
+        self.play_msg = ""
 
     def needs_animation(self):
         if self.loading_more:
@@ -706,6 +737,8 @@ class SearchInput(Screen):
                      f"{page_str}")
             if self.load_err and not self.loading_more:
                 stats = f" {self.load_err[:w-6]}"
+            if self.play_msg:
+                stats = f" {self.play_msg[:w-6]}"
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
             self.app.stdscr.addstr(h - 3, 2, stats[:w - 4])
@@ -718,7 +751,7 @@ class SearchInput(Screen):
             self.draw_status("Press Esc to go back")
             return
 
-        self.draw_status("↑/↓ move  PgUp/PgDn page  Tab videos/playlists  Enter select  n new  Esc back")
+        self.draw_status("↑/↓ move  PgUp/PgDn page  Tab V/P  p play  Enter select  n new  Esc")
 
     def handle_key(self, key):
         if self.mode == "loading":
@@ -765,6 +798,8 @@ class SearchInput(Screen):
         page = max(1, h - 6)
         items = self.visible()
         n_rows = len(items) + (1 if self.has_more() else 0)
+        if key not in (curses.KEY_ENTER, 10, 13, 27):
+            self.play_msg = ""  # transient play feedback clears on next key
         if key == 27:
             self.mode = "input"
             self.msg = ""
@@ -782,6 +817,13 @@ class SearchInput(Screen):
             self.more_playlists = False
         elif key in (ord("t"), ord("T"), 9):  # t / Tab: Videos <-> Playlists
             self.toggle_view()
+        elif key in (ord("p"), ord("P")):  # play highlighted item externally
+            if items and 0 <= self.idx < len(items):
+                sel = items[self.idx]
+                ok, note = play_media(sel.get("url", ""))
+                title = (sel.get("title") or "?")[:40]
+                self.play_msg = f"{note} {title}" if ok \
+                    else f"Can't play: {note}"
         elif key == curses.KEY_UP:
             self.idx = max(0, self.idx - 1)
         elif key == curses.KEY_DOWN:
@@ -816,6 +858,7 @@ class SearchInput(Screen):
         self.more_playlists = False
         self.loading_more = False
         self.load_err = ""
+        self.play_msg = ""
 
         def run():
             try:
