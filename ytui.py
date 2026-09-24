@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -233,6 +234,24 @@ def fmt_eta(sec_str):
         return f"{m}:{s:02d}"
     except (ValueError, TypeError):
         return str(sec_str)
+
+
+def fmt_dur(dur):
+    """Safe duration formatter — yt-dlp returns None for livestreams,
+    upcoming premieres and playlists. Never raises."""
+    try:
+        if dur is None:
+            return "?:??"
+        dur = int(float(dur))
+    except (ValueError, TypeError):
+        return "?:??"
+    if dur <= 0:
+        return "?:??"
+    mins, secs = divmod(dur, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins}:{secs:02d}"
 
 
 def sanitize_filename(name, max_len=80):
@@ -507,16 +526,35 @@ class URLInput(Screen):
 
 
 class SearchInput(Screen):
-    """Search YouTube videos via yt-dlp ytsearch: and pick from results."""
+    """Search YouTube videos + playlists via yt-dlp and pick from results."""
+    SEARCH_LIMIT = 30
+    VIEWS = ("all", "videos", "playlists")
+
     def __init__(self, app):
         super().__init__(app)
         self.query = ""
-        self.results = []
+        self.results = []  # each: id/title/url/channel/duration/views/kind
         self.idx = 0
         self.offset = 0
         self.mode = "input"  # "input" | "loading" | "results"
+        self.view = "all"  # "all" | "videos" | "playlists"
         self.error = ""
         self.msg = ""
+
+    def visible(self):
+        """Results filtered by current view (all/videos/playlists)."""
+        if self.view == "videos":
+            return [r for r in self.results if r.get("kind") != "playlist"]
+        if self.view == "playlists":
+            return [r for r in self.results if r.get("kind") == "playlist"]
+        return self.results
+
+    def cycle_view(self):
+        """Cycle All -> Videos -> Playlists -> All, reset cursor."""
+        i = self.VIEWS.index(self.view)
+        self.view = self.VIEWS[(i + 1) % len(self.VIEWS)]
+        self.idx = 0
+        self.offset = 0
 
     def render(self):
         h, w = self.app.stdscr.getmaxyx()
@@ -540,7 +578,7 @@ class SearchInput(Screen):
 
         # mode == "input"
         lines = [
-            "Search for videos on YouTube. Results are fetched via yt-dlp.",
+            "Search YouTube videos & playlists. Results via yt-dlp.",
             "",
             "Search: " + self.query + ("█" if len(self.query) < w - 10 else ""),
         ]
@@ -560,14 +598,24 @@ class SearchInput(Screen):
         self.draw_status("Enter search  Esc back  Ctrl+U clear")
 
     def _render_results(self, h, w):
+        items = self.visible()
+        # keep cursor inside filtered list
+        if self.idx >= len(items):
+            self.idx = max(0, len(items) - 1)
+        view_label = {"all": "All", "videos": "Videos",
+                      "playlists": "Playlists"}[self.view]
+        nv = sum(1 for r in self.results if r.get("kind") != "playlist")
+        np = sum(1 for r in self.results if r.get("kind") == "playlist")
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
-            self.app.stdscr.addstr(1, 0, f" Results for: {self.query[:w-16]}")
+            self.app.stdscr.addstr(
+                1, 0,
+                f" Results for: {self.query[:w-40]} [{view_label}] ({nv}V+{np}P)"[:w-1])
             self.app.stdscr.attroff(curses.color_pair(COLOR_INFO))
         except curses.error:
             pass
 
-        header = f"{'':4}{'Title':<50}  {'Channel':<20}  {'Dur':6}"
+        header = f"{'':4}{'':4}{'Title':<46}  {'Channel':<18}  {'Dur':6}"
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
             self.app.stdscr.addstr(2, 0, header[:w - 1])
@@ -575,22 +623,20 @@ class SearchInput(Screen):
         except curses.error:
             pass
 
-        max_visible = h - 6
+        max_visible = max(1, h - 6)
         if self.idx < self.offset:
             self.offset = self.idx
         if self.idx >= self.offset + max_visible:
             self.offset = self.idx - max_visible + 1
 
-        for i, r in enumerate(self.results[self.offset:self.offset + max_visible]):
+        for i, r in enumerate(items[self.offset:self.offset + max_visible]):
             y = 3 + i
             num = f"{self.offset + i + 1:>3}."
-            title = r.get('title', '?')[:48]
-            channel = r.get('channel', '?')[:18]
-            dur = r.get('duration', 0)
-            mins, secs = divmod(int(dur), 60)
-            hours, mins = divmod(mins, 60)
-            dur_str = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}" if dur else "?:??"
-            line = f" {num} {title:<50}  {channel:<20}  {dur_str:>6}"
+            tag = "[P]" if r.get("kind") == "playlist" else "[V]"
+            title = (r.get('title') or '?')[:44]
+            channel = (r.get('channel') or '?')[:16]
+            dur_str = fmt_dur(r.get('duration'))
+            line = f" {num} {tag} {title:<46}  {channel:<18}  {dur_str:>6}"
             attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if (self.offset + i) == self.idx else curses.color_pair(COLOR_MENU)
             try:
                 self.app.stdscr.attron(attr)
@@ -599,8 +645,18 @@ class SearchInput(Screen):
             except curses.error:
                 pass
 
-        # Stats
-        stats = f" {len(self.results)} results  showing {self.offset + 1}-{min(self.offset + max_visible, len(self.results))}"
+        # Stats + pagination
+        total = len(items)
+        if total == 0:
+            stats = f" No {view_label.lower()} found — press t to change filter "
+            page_str = ""
+        else:
+            pages = (total + max_visible - 1) // max_visible
+            cur_page = self.offset // max_visible + 1
+            page_str = f"  Page {cur_page}/{pages}" if pages > 1 else ""
+            stats = (f" {total} {view_label.lower()}  "
+                     f"showing {self.offset + 1}-{min(self.offset + max_visible, total)}"
+                     f"{page_str}")
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
             self.app.stdscr.addstr(h - 3, 2, stats[:w - 4])
@@ -613,7 +669,7 @@ class SearchInput(Screen):
             self.draw_status("Press Esc to go back")
             return
 
-        self.draw_status("↑/↓ navigate  Enter select  Esc back  n new search")
+        self.draw_status("↑/↓ move  PgUp/PgDn page  t filter V/P  Enter select  n new  Esc back")
 
     def handle_key(self, key):
         if self.mode == "loading":
@@ -656,22 +712,37 @@ class SearchInput(Screen):
             self.msg = ""
 
     def _handle_results_key(self, key):
+        h, _w = self.app.stdscr.getmaxyx()
+        page = max(1, h - 6)
+        items = self.visible()
         if key == 27:
             self.mode = "input"
             self.msg = ""
             self.query = ""
+            self.view = "all"
         elif key in (ord("n"), ord("N")):
             self.mode = "input"
             self.query = ""
             self.results = []
+            self.view = "all"
             self.msg = ""
+        elif key in (ord("t"), ord("T"), 9):  # t / Tab: cycle All/Videos/Playlists
+            self.cycle_view()
         elif key == curses.KEY_UP:
             self.idx = max(0, self.idx - 1)
         elif key == curses.KEY_DOWN:
-            self.idx = min(len(self.results) - 1, self.idx + 1)
+            self.idx = min(max(0, len(items) - 1), self.idx + 1)
+        elif key == curses.KEY_NPAGE:  # PageDown
+            self.idx = min(max(0, len(items) - 1), self.idx + page)
+        elif key == curses.KEY_PPAGE:  # PageUp
+            self.idx = max(0, self.idx - page)
+        elif key == curses.KEY_HOME:
+            self.idx = 0
+        elif key == curses.KEY_END:
+            self.idx = max(0, len(items) - 1)
         elif key in (curses.KEY_ENTER, 10, 13):
-            if self.results:
-                selected = self.results[self.idx]
+            if items and 0 <= self.idx < len(items):
+                selected = items[self.idx]
                 url = selected.get('url', '')
                 if url:
                     self.app.push_screen(FormatSelector(self.app, url))
@@ -682,52 +753,96 @@ class SearchInput(Screen):
         self.results = []
         self.idx = 0
         self.offset = 0
+        self.view = "all"
+
+        def fetch_json(args, timeout):
+            """Run yt-dlp, return (entries, error_line)."""
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return [], "timed out"
+            if result.returncode != 0:
+                err = result.stderr.strip().splitlines()
+                line = next((l for l in reversed(err) if l.strip()),
+                            "unknown error")[:300]
+                return [], line
+            entries = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return entries, ""
 
         def run():
             try:
-                # Escape special regex chars in query — ytsearch handles plain text
                 search_q = self.query.strip()
-                result = subprocess.run(
-                    ["yt-dlp", "--flat-playlist", "--dump-json",
-                     f"ytsearch15:{search_q}"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if result.returncode != 0:
-                    self.error = result.stderr.strip()[:100]
-                    self.mode = "input"
-                    return
-                lines = [l for l in result.stdout.strip().split('\n') if l]
-                for line in lines:
-                    try:
-                        d = json.loads(line)
-                        vid_url = d.get('original_url') or d.get('webpage_url') or \
-                                   f"https://youtube.com/watch?v={d.get('id', '')}"
-                        ch = d.get('channel') or d.get('uploader') or d.get('channel_url') or '?'
-                        if ch and ch.startswith('http'):
-                            ch = '?'
-                        self.results.append({
-                            'id': d.get('id', ''),
-                            'title': d.get('title', '?'),
-                            'url': vid_url,
-                            'channel': ch[:30],
-                            'duration': d.get('duration', 0),
-                            'views': d.get('view_count', 0),
-                        })
-                    except json.JSONDecodeError:
-                        continue
+                limit = self.SEARCH_LIMIT
+                base = ["yt-dlp", "--flat-playlist", "--dump-json",
+                        "--no-warnings", "--socket-timeout", "15",
+                        "--retries", "2"]
+                # 1) videos via ytsearch (videos only)
+                vids, vid_err = fetch_json(
+                    base + [f"ytsearch{limit}:{search_q}"], timeout=60)
+                # 2) playlists via YouTube playlist-filter search page
+                pl_url = ("https://www.youtube.com/results?search_query="
+                          + urllib.parse.quote(search_q)
+                          + "&sp=EgIQAw%253D%253D")
+                pls, pl_err = fetch_json(
+                    base + ["--playlist-end", str(limit), pl_url],
+                    timeout=60)
+
+                for d in vids:
+                    vid_url = d.get('original_url') or d.get('webpage_url') or \
+                        f"https://youtube.com/watch?v={d.get('id', '')}"
+                    ch = d.get('channel') or d.get('uploader') or \
+                        d.get('channel_url') or '?'
+                    if ch and ch.startswith('http'):
+                        ch = '?'
+                    self.results.append({
+                        'id': d.get('id', ''),
+                        'title': d.get('title') or '?',
+                        'url': vid_url,
+                        'channel': ch[:30],
+                        'duration': d.get('duration') or 0,
+                        'views': d.get('view_count') or 0,
+                        'kind': 'video',
+                    })
+                for d in pls:
+                    pid = d.get('id', '')
+                    pl_link = d.get('original_url') or d.get('webpage_url') or \
+                        f"https://www.youtube.com/playlist?list={pid}"
+                    ch = d.get('channel') or d.get('uploader') or \
+                        d.get('channel_url') or '?'
+                    if ch and ch.startswith('http'):
+                        ch = '?'
+                    self.results.append({
+                        'id': pid,
+                        'title': d.get('title') or '?',
+                        'url': pl_link,
+                        'channel': ch[:30],
+                        'duration': d.get('duration') or 0,
+                        'views': d.get('view_count') or 0,
+                        'kind': 'playlist',
+                    })
                 if not self.results:
-                    self.error = "No results found"
+                    detail = vid_err or pl_err or "no data"
+                    self.error = f"No results found ({detail})"
+                    self.msg = ("No results found. Try different keywords "
+                                "or paste a URL directly.")
                     self.mode = "input"
                 else:
                     self.mode = "results"
-            except subprocess.TimeoutExpired:
-                self.error = "Search timed out after 30s"
-                self.mode = "input"
             except FileNotFoundError:
                 self.error = "yt-dlp not found! Install with: pkg install yt-dlp"
+                self.msg = self.error
                 self.mode = "input"
             except Exception as e:
-                self.error = str(e)[:100]
+                self.error = str(e)[:300]
+                self.msg = f"Search failed: {self.error}"
                 self.mode = "input"
 
         threading.Thread(target=run, daemon=True).start()
