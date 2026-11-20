@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -443,6 +444,85 @@ class PlaybackManager:
         self._ipc_sock = None
         self._gen = 0
         self._last_args = None
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        self._state_file = Path(tempfile.gettempdir()) / f"yt-tui-player-{uid}.json"
+        self._reattach()
+
+    @staticmethod
+    def _is_pgid_alive(pgid):
+        if not pgid:
+            return False
+        try:
+            os.killpg(int(pgid), 0)
+            return True
+        except Exception:
+            return False
+
+    def _save_state(self):
+        try:
+            data = {
+                "pgid": self._pgid,
+                "ipc_sock": self._ipc_sock,
+                "title": self.title,
+                "url": self.url,
+                "mode": self.mode,
+                "state": self.state,
+                "output_label": self.output_label,
+                "last_args": list(self._last_args) if self._last_args else None,
+            }
+            self._state_file.write_text(json.dumps(data))
+        except Exception:
+            pass
+
+    def _clear_state(self):
+        try:
+            if self._state_file.exists():
+                self._state_file.unlink()
+        except Exception:
+            pass
+
+    def _reattach(self):
+        try:
+            if not self._state_file.exists():
+                return
+            data = json.loads(self._state_file.read_text())
+            pgid = data.get("pgid")
+            if not self._is_pgid_alive(pgid):
+                self._clear_state()
+                return
+            with self._lock:
+                self._gen += 1
+                gen = self._gen
+                self._pgid = int(pgid)
+                self._ipc_sock = data.get("ipc_sock")
+                self.title = data.get("title", "")
+                self.url = data.get("url", "")
+                self.mode = data.get("mode", "audio")
+                self.state = data.get("state", "playing")
+                if self.state not in ("playing", "paused"):
+                    self.state = "playing"
+                self.output_label = data.get("output_label", "")
+                la = data.get("last_args")
+                self._last_args = tuple(la) if isinstance(la, list) else None
+            t = threading.Thread(target=self._watch_reattached, args=(gen, int(pgid)), daemon=True)
+            t.start()
+        except Exception:
+            self._clear_state()
+
+    def _watch_reattached(self, gen, pgid):
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                if self._gen != gen or self.state == "idle":
+                    return
+            if not self._is_pgid_alive(pgid):
+                with self._lock:
+                    if self._gen == gen:
+                        self.state = "idle"
+                        self._pgid = None
+                        self._ipc_sock = None
+                        self._clear_state()
+                return
 
     def state_snapshot(self):
         with self._lock:
@@ -551,6 +631,7 @@ class PlaybackManager:
             self._pgid = proc.pid
             self._ipc_sock = sock_path
             self.state = "playing"
+            self._save_state()
 
         _, stderr_data = proc.communicate()
         with self._lock:
@@ -563,6 +644,7 @@ class PlaybackManager:
                     self.state = "idle"
                 self._procs = []
                 self._pgid = None
+                self._clear_state()
         try:
             if os.path.exists(sock_path):
                 os.unlink(sock_path)
@@ -638,6 +720,7 @@ class PlaybackManager:
             self._procs = [ff_proc, ap_proc]
             self._pgid = ff_proc.pid
             self.state = "playing"
+            self._save_state()
 
         _, ap_err = ap_proc.communicate()
         ff_proc.wait()
@@ -651,6 +734,7 @@ class PlaybackManager:
                     self.state = "idle"
                 self._procs = []
                 self._pgid = None
+                self._clear_state()
 
     def toggle_pause(self):
         with self._lock:
@@ -668,6 +752,7 @@ class PlaybackManager:
                     s.sendall(b'{"command":["cycle","pause"]}\n')
                 with self._lock:
                     self.state = "paused" if cur_state == "playing" else "playing"
+                    self._save_state()
                 return True, self.state
             except Exception:
                 pass
@@ -677,6 +762,7 @@ class PlaybackManager:
             os.killpg(pgid, sig)
             with self._lock:
                 self.state = "paused" if cur_state == "playing" else "playing"
+                self._save_state()
             return True, self.state
         except Exception as e:
             return False, str(e)[:60]
@@ -698,6 +784,7 @@ class PlaybackManager:
                         s.sendall(b'{"command":["set_property","pause",false]}\n')
                 with self._lock:
                     self.state = "playing"
+                    self._save_state()
                 return True, "Restarted from 0:00"
             except Exception:
                 pass
@@ -718,6 +805,7 @@ class PlaybackManager:
             self._ipc_sock = None
             self.state = "idle"
             self.error_msg = ""
+            self._clear_state()
 
         if pgid:
             try:
@@ -1111,13 +1199,32 @@ class MainMenu(Screen):
         except curses.error:
             pass
 
-        self.draw_status("\u2191/\u2193 navigate  Enter select  q quit  t toggle theme")
+        st, p_title, p_mode, _p_err = self.app.player.state_snapshot()
+        if st in ("playing", "paused", "loading"):
+            icon = "▶" if st == "playing" else ("⏸" if st == "paused" else "⏳")
+            p_color = COLOR_PROGRESS if st == "playing" else (COLOR_SEL if st == "paused" else COLOR_INFO)
+            p_line = f"  {icon} {st.capitalize()} ({p_mode}): {p_title}"
+            try:
+                self.app.stdscr.attron(curses.color_pair(p_color))
+                self.app.stdscr.addstr(7 + len(self.items) + 3, 4, p_line[:w-8])
+                self.app.stdscr.attroff(curses.color_pair(p_color))
+            except curses.error:
+                pass
+            self.draw_status("\u2191/\u2193 navigate  Enter select  Space pause  0 restart  s stop  q quit")
+        else:
+            self.draw_status("\u2191/\u2193 navigate  Enter select  q quit  t toggle theme")
 
     def handle_key(self, key):
         if key == ord("?"):
             self.app.push_screen(HelpScreen(self.app))
         elif key == ord("t"):
             self.app.toggle_theme()
+        elif key == ord(" "):
+            self.app.player.toggle_pause()
+        elif key == ord("0"):
+            self.app.player.restart()
+        elif key in (ord("s"), ord("S")):
+            self.app.player.stop()
         elif key in (ord("q"), 27):
             self.app.running = False
         elif key == curses.KEY_UP:
