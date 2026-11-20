@@ -11,6 +11,7 @@ import platform
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -32,13 +33,28 @@ def debug_log(msg):
 CONFIG_DIR = Path.home() / ".config" / "yt-tui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
+SEARCH_HISTORY_FILE = CONFIG_DIR / "search_history.json"
 
 DEFAULT_CONFIG = {
     "last_dir": "/sdcard/Download",
     "default_format": "bv*[height<=1080]+ba/b[height<=1080]",
     "max_history": 100,
     "theme": "dark",
+    "audio_output": "auto",
+    "play_format": "bestvideo+bestaudio/best",
+    "search_history_enabled": True,
+    "max_search_history": 25,
 }
+
+PLAY_QUALITY_PRESETS = [
+    ("Best Available (DASH/HLS)", "bestvideo+bestaudio/best"),
+    ("1080p Max", "bv*[height<=1080]+ba/b[height<=1080]"),
+    ("720p Max", "bv*[height<=720]+ba/b[height<=720]"),
+    ("480p Max", "bv*[height<=480]+ba/b[height<=480]"),
+    ("Best Audio (Any Codec)", "bestaudio/best"),
+    ("Audio: Opus (WebM)", "bestaudio[acodec=opus]/bestaudio/best"),
+    ("Audio: AAC (M4A)", "bestaudio[acodec^=mp4a]/bestaudio/best"),
+]
 
 COLOR_MENU = 1
 COLOR_TITLE = 2
@@ -62,14 +78,14 @@ THEME_DARK = {
 }
 
 THEME_LIGHT = {
-    "menu":      (curses.COLOR_BLACK, -1),
-    "title":     (curses.COLOR_BLACK, -1),
-    "sel":       (-1, -1),
+    "menu":      (curses.COLOR_BLACK, curses.COLOR_WHITE),
+    "title":     (curses.COLOR_BLUE, curses.COLOR_WHITE),
+    "sel":       (curses.COLOR_WHITE, curses.COLOR_BLUE),
     "status":    (curses.COLOR_WHITE, curses.COLOR_BLUE),
-    "progress":  (curses.COLOR_GREEN, -1),
-    "header":    (-1, -1),
-    "info":      (-1, -1),
-    "error":     (curses.COLOR_RED, -1),
+    "progress":  (curses.COLOR_GREEN, curses.COLOR_WHITE),
+    "header":    (curses.COLOR_BLUE, curses.COLOR_WHITE),
+    "info":      (curses.COLOR_MAGENTA, curses.COLOR_WHITE),
+    "error":     (curses.COLOR_RED, curses.COLOR_WHITE),
 }
 
 THEMES = {"dark": THEME_DARK, "light": THEME_LIGHT}
@@ -283,36 +299,449 @@ def play_media(url):
         return False, str(e)[:100]
 
 
-def sanitize_filename(name, max_len=80):
-    """Bersihkan string untuk jadi nama folder/file, ganti spasi dgn underscore."""
-    if not name:
-        return "untitled"
-    # Hanya允许 alfanumerik, spasi, underscore, strip, hyphen
-    clean = re.sub(r'[^\w\s\-]', '', name).strip()
-    clean = re.sub(r'\s+', '_', clean)
-    clean = clean[:max_len].rstrip('_') or "untitled"
-    return clean
-
-
-def normalize_url(url):
-    """Konversi YouTube Music URL (music.youtube.com) ke www.youtube.com biasa."""
-    if not url:
-        return url
-    # music.youtube.com/watch?v=XXX → www.youtube.com/watch?v=XXX
-    # music.youtube.com/playlist?list=XXX → www.youtube.com/playlist?list=XXX
-    url = url.replace("music.youtube.com", "www.youtube.com")
-    # Juga handle youtube.com tanpa www
-    if "://youtube.com/" in url:
-        url = url.replace("://youtube.com/", "://www.youtube.com/")
-    return url
-
-
-def fmt_time(ts_str):
+def has_graphical_display():
+    """Return True when running in a graphical session (Wayland, X11, Windows, macOS)."""
     try:
-        dt = datetime.fromisoformat(ts_str)
-        return dt.strftime("%d %b %H:%M")
-    except (ValueError, TypeError):
-        return ts_str
+        sysname = platform.system()
+        if sysname in ("Windows", "Darwin"):
+            return True
+        return bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+    except Exception:
+        return False
+
+
+def has_pulse_or_pipewire():
+    """Return True if PipeWire or PulseAudio daemon is active and responding."""
+    try:
+        if shutil.which("pactl"):
+            r = subprocess.run(["pactl", "info"], capture_output=True, timeout=1.5)
+            if r.returncode == 0:
+                return True
+        if shutil.which("wpctl"):
+            r = subprocess.run(["wpctl", "status"], capture_output=True, timeout=1.5)
+            if r.returncode == 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def detect_audio_outputs():
+    """Detect available audio output sinks.
+
+    On PipeWire/PulseAudio, returns the default sink plus any enumerated sinks.
+    Otherwise detects BlueALSA Bluetooth sinks and ALSA PCM devices.
+    Returns a list of (label, backend, device_id) tuples. Never raises.
+    """
+    outputs = []
+    seen = set()
+
+    def _add(label, backend, dev_id):
+        key = (backend, dev_id)
+        if key not in seen:
+            seen.add(key)
+            outputs.append((label, backend, dev_id))
+
+    try:
+        if has_pulse_or_pipewire():
+            _add("Default (PipeWire / PulseAudio)", "pulse", "auto")
+            if shutil.which("pactl"):
+                try:
+                    out = subprocess.check_output(
+                        ["pactl", "list", "short", "sinks"],
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    ).decode(errors="replace")
+                    for line in out.splitlines():
+                        parts = line.split("\t")
+                        if len(parts) >= 2 and parts[1].strip():
+                            sink_name = parts[1].strip()
+                            _add(f"Pulse/PW: {sink_name[:42]}", "pulse", sink_name)
+                except Exception:
+                    pass
+            return outputs
+    except Exception:
+        pass
+
+    # Non-Pulse/PipeWire (e.g. headless ALSA / BlueALSA)
+    if shutil.which("bluealsa-cli"):
+        try:
+            out = subprocess.check_output(
+                ["bluealsa-cli", "list-pcms"],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).decode(errors="replace")
+            for line in out.splitlines():
+                line = line.strip()
+                if "a2dpsrc/sink" in line or "scosrc/sink" in line:
+                    m = re.search(r"dev_([0-9A-Fa-f_]{17})/(a2dp|sco)", line)
+                    if m:
+                        mac = m.group(1).replace("_", ":")
+                        prof = m.group(2)
+                        alias = mac
+                        if shutil.which("bluetoothctl"):
+                            try:
+                                info = subprocess.check_output(
+                                    ["bluetoothctl", "info", mac],
+                                    stderr=subprocess.DEVNULL,
+                                    timeout=1.5,
+                                ).decode(errors="replace")
+                                nm = re.search(r"^\s*Name:\s*(.+)$", info, re.M)
+                                if nm:
+                                    alias = f"{nm.group(1).strip()} ({mac})"
+                            except Exception:
+                                pass
+                        _add(f"Bluetooth: {alias} [{prof}]", "alsa", f"bluealsa:DEV={mac},PROFILE={prof}")
+        except Exception:
+            pass
+
+    if shutil.which("aplay"):
+        try:
+            out = subprocess.check_output(
+                ["aplay", "-L"],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).decode(errors="replace")
+            cur_dev = None
+            cur_desc = ""
+            for raw in out.splitlines():
+                if not raw.startswith(" ") and raw.strip():
+                    if cur_dev and cur_dev not in ("null", "discard", "oss"):
+                        if any(cur_dev.startswith(p) for p in ("default", "sysdefault", "plughw", "hw", "bluealsa")):
+                            lbl = f"ALSA: {cur_dev}"
+                            if cur_desc:
+                                lbl = f"ALSA: {cur_dev} ({cur_desc[:28]})"
+                            _add(lbl, "alsa", cur_dev)
+                    cur_dev = raw.strip()
+                    cur_desc = ""
+                elif cur_dev and not cur_desc and raw.strip():
+                    cur_desc = raw.strip()
+            if cur_dev and cur_dev not in ("null", "discard", "oss"):
+                if any(cur_dev.startswith(p) for p in ("default", "sysdefault", "plughw", "hw", "bluealsa")):
+                    _add(f"ALSA: {cur_dev}", "alsa", cur_dev)
+        except Exception:
+            pass
+
+    if not outputs:
+        _add("System Default (ALSA)", "alsa", "default")
+    return outputs
+
+
+class PlaybackManager:
+    """Manages terminal audio/video playback with pause, stop, and live stream support."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.state = "idle"  # idle | loading | playing | paused | error
+        self.title = ""
+        self.url = ""
+        self.mode = "audio"
+        self.output_label = ""
+        self.error_msg = ""
+        self._procs = []
+        self._pgid = None
+        self._ipc_sock = None
+        self._gen = 0
+        self._last_args = None
+
+    def state_snapshot(self):
+        with self._lock:
+            return (self.state, self.title, self.mode, self.error_msg)
+
+    def start(self, url, title, mode="audio", backend="auto", device="auto", output_label="", fmt=None):
+        if not url:
+            with self._lock:
+                self.state = "error"
+                self.error_msg = "No URL provided."
+            return
+        if mode == "video" and not has_graphical_display():
+            with self._lock:
+                self.state = "error"
+                self.error_msg = "Video playback disabled: no Wayland/X11 display."
+            return
+
+        self.stop()
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            self._last_args = (url, title, mode, backend, device, output_label, fmt)
+            self.state = "loading"
+            self.title = title or url
+            self.url = url
+            self.mode = mode
+            self.output_label = output_label or device
+            self.error_msg = ""
+
+        t = threading.Thread(
+            target=self._run_worker,
+            args=(gen, url, mode, backend, device, fmt),
+            daemon=True,
+        )
+        t.start()
+
+    def _run_worker(self, gen, url, mode, backend, device, fmt=None):
+        try:
+            mpv_bin = shutil.which("mpv")
+            if mode == "video" and not mpv_bin:
+                with self._lock:
+                    if self._gen == gen:
+                        self.state = "error"
+                        self.error_msg = "mpv is required for video playback."
+                return
+
+            if mpv_bin:
+                rc = self._run_mpv(gen, mpv_bin, url, mode, backend, device, fmt)
+                if rc == 127 and mode == "audio":
+                    # mpv failed due to missing shared lib; fall back to ffmpeg+aplay
+                    with self._lock:
+                        if self._gen == gen:
+                            self.state = "loading"
+                            self.error_msg = ""
+                    self._run_ffmpeg_alsa(gen, url, device, fmt)
+            else:
+                self._run_ffmpeg_alsa(gen, url, device, fmt)
+        except Exception as e:
+            debug_log(f"Playback worker error: {e}")
+            with self._lock:
+                if self._gen == gen:
+                    self.state = "error"
+                    self.error_msg = str(e)[:80]
+
+    def _run_mpv(self, gen, mpv_bin, url, mode, backend, device, fmt=None):
+        sock_path = f"/tmp/yt-tui-mpv-{os.getpid()}-{gen}.sock"
+        cmd = [
+            mpv_bin,
+            "--really-quiet",
+            "--no-resume-playback",
+            f"--input-ipc-server={sock_path}",
+            "--ytdl=yes",
+        ]
+        if mode == "audio":
+            ytdl_fmt = fmt if (fmt and "bestaudio" in fmt) else "bestaudio/best"
+            cmd.extend(["--no-video", f"--ytdl-format={ytdl_fmt}"])
+        else:
+            ytdl_fmt = fmt or "bestvideo+bestaudio/best"
+            cmd.extend(["--force-window=yes", f"--ytdl-format={ytdl_fmt}"])
+
+        if backend == "pulse":
+            cmd.append("--ao=pulse")
+            if device and device != "auto":
+                cmd.append(f"--audio-device=pulse/{device}")
+        elif backend == "alsa":
+            cmd.append("--ao=alsa")
+            if device and device != "auto":
+                cmd.append(f"--audio-device=alsa/{device}")
+
+        cmd.append(url)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        with self._lock:
+            if self._gen != gen:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                return
+            self._procs = [proc]
+            self._pgid = proc.pid
+            self._ipc_sock = sock_path
+            self.state = "playing"
+
+        _, stderr_data = proc.communicate()
+        with self._lock:
+            if self._gen == gen:
+                if proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
+                    err = (stderr_data or b"").decode(errors="replace").strip().splitlines()
+                    self.state = "error"
+                    self.error_msg = (err[-1] if err else f"mpv exited ({proc.returncode})")[:80]
+                else:
+                    self.state = "idle"
+                self._procs = []
+                self._pgid = None
+        try:
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+        except Exception:
+            pass
+        return proc.returncode
+
+    def _run_ffmpeg_alsa(self, gen, url, device, fmt=None):
+        ffmpeg_bin = shutil.which("ffmpeg")
+        aplay_bin = shutil.which("aplay")
+        if not ffmpeg_bin or not aplay_bin:
+            with self._lock:
+                if self._gen == gen:
+                    self.state = "error"
+                    self.error_msg = "Need mpv, or ffmpeg + aplay for audio playback."
+            return
+
+        ytdl_fmt = fmt if (fmt and "bestaudio" in fmt) else "bestaudio/best"
+        stream_url = subprocess.check_output(
+            ["yt-dlp", "-g", "-f", ytdl_fmt, "--no-playlist", url],
+            stderr=subprocess.PIPE,
+            timeout=20,
+        ).decode(errors="replace").strip().splitlines()[0]
+
+        ff_cmd = [
+            ffmpeg_bin,
+            "-loglevel", "error",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", stream_url,
+            "-vn",
+            "-f", "s16le",
+            "-ac", "2",
+            "-ar", "48000",
+            "pipe:1",
+        ]
+        alsa_dev = device if (device and device != "auto") else "default"
+        ap_cmd = [
+            aplay_bin,
+            "-q",
+            "-D", alsa_dev,
+            "-f", "S16_LE",
+            "-r", "48000",
+            "-c", "2",
+            "-t", "raw",
+        ]
+
+        ff_proc = subprocess.Popen(
+            ff_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        ap_proc = subprocess.Popen(
+            ap_cmd,
+            stdin=ff_proc.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=lambda: os.setpgid(0, ff_proc.pid),
+        )
+        if ff_proc.stdout:
+            ff_proc.stdout.close()
+
+        with self._lock:
+            if self._gen != gen:
+                try:
+                    os.killpg(ff_proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                return
+            self._procs = [ff_proc, ap_proc]
+            self._pgid = ff_proc.pid
+            self.state = "playing"
+
+        _, ap_err = ap_proc.communicate()
+        ff_proc.wait()
+        with self._lock:
+            if self._gen == gen:
+                if ap_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
+                    err = (ap_err or b"").decode(errors="replace").strip()
+                    self.state = "error"
+                    self.error_msg = (err or f"aplay exited ({ap_proc.returncode})")[:80]
+                else:
+                    self.state = "idle"
+                self._procs = []
+                self._pgid = None
+
+    def toggle_pause(self):
+        with self._lock:
+            if self.state not in ("playing", "paused") or not self._pgid:
+                return False, "Nothing playing"
+            sock_path = self._ipc_sock
+            pgid = self._pgid
+            cur_state = self.state
+
+        if sock_path and os.path.exists(sock_path):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.0)
+                    s.connect(sock_path)
+                    s.sendall(b'{"command":["cycle","pause"]}\n')
+                with self._lock:
+                    self.state = "paused" if cur_state == "playing" else "playing"
+                return True, self.state
+            except Exception:
+                pass
+
+        try:
+            sig = signal.SIGSTOP if cur_state == "playing" else signal.SIGCONT
+            os.killpg(pgid, sig)
+            with self._lock:
+                self.state = "paused" if cur_state == "playing" else "playing"
+            return True, self.state
+        except Exception as e:
+            return False, str(e)[:60]
+
+    def restart(self):
+        """Seek back to 0:00 (via mpv IPC) or restart playback from the beginning."""
+        with self._lock:
+            sock_path = self._ipc_sock
+            cur_state = self.state
+            last_args = self._last_args
+
+        if cur_state in ("playing", "paused") and sock_path and os.path.exists(sock_path):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.0)
+                    s.connect(sock_path)
+                    s.sendall(b'{"command":["seek","0","absolute"]}\n')
+                    if cur_state == "paused":
+                        s.sendall(b'{"command":["set_property","pause",false]}\n')
+                with self._lock:
+                    self.state = "playing"
+                return True, "Restarted from 0:00"
+            except Exception:
+                pass
+
+        if last_args:
+            self.start(*last_args)
+            return True, "Restarting from 0:00…"
+        return False, "Nothing to restart"
+
+    def stop(self):
+        with self._lock:
+            self._gen += 1
+            pgid = self._pgid
+            procs = list(self._procs)
+            sock_path = self._ipc_sock
+            self._procs = []
+            self._pgid = None
+            self._ipc_sock = None
+            self.state = "idle"
+            self.error_msg = ""
+
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGCONT)
+            except Exception:
+                pass
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                pass
+            for p in procs:
+                try:
+                    p.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+        if sock_path:
+            try:
+                if os.path.exists(sock_path):
+                    os.unlink(sock_path)
+            except Exception:
+                pass
 
 
 class Screen:
@@ -418,6 +847,215 @@ class Screen:
                 self.app.stdscr.attroff(curses.color_pair(COLOR_MENU))
             except curses.error:
                 pass
+
+
+class PlayOptionsScreen(Screen):
+    """Interactive playback dialog: browser vs terminal audio/video + sink picker."""
+
+    def __init__(self, app, item):
+        super().__init__(app)
+        self.item = item or {}
+        self.url = self.item.get("url", "")
+        self.title = self.item.get("title") or self.url or "Media"
+        self.outputs = detect_audio_outputs()
+        self.out_idx = 0
+        saved_dev = self.app.config.get("audio_output", "auto") if hasattr(self.app.config, "get") else "auto"
+        for i, (_lbl, _be, dev) in enumerate(self.outputs):
+            if dev == saved_dev:
+                self.out_idx = i
+                break
+        self.has_gui = has_graphical_display()
+        self.presets = PLAY_QUALITY_PRESETS
+        self.fmt_idx = 0
+        saved_fmt = self.app.config.get("play_format", "") if hasattr(self.app.config, "get") else ""
+        for i, (_lbl, fexpr) in enumerate(self.presets):
+            if fexpr == saved_fmt:
+                self.fmt_idx = i
+                break
+        self.idx = 0
+        self.msg = ""
+
+    def _actions(self):
+        out_label = self.outputs[self.out_idx][0] if self.outputs else "Default"
+        fmt_label = self.presets[self.fmt_idx][0]
+        vid_label = "Play Video + Audio (mpv)" if self.has_gui else "Play Video + Audio (disabled: headless)"
+        return [
+            ("audio", "Play Audio Only (Terminal)"),
+            ("video", vid_label),
+            ("browser", "Open in Default Web Browser"),
+            ("quality", f"Quality/Codec: {fmt_label}"),
+            ("sink", f"Audio Output: {out_label}"),
+        ]
+
+    def render(self):
+        self.clear_content()
+        self.draw_title("Play Media")
+        h, w = self.app.stdscr.getmaxyx()
+
+        try:
+            self.app.stdscr.attron(curses.color_pair(COLOR_INFO) | curses.A_BOLD)
+            self.app.stdscr.addstr(2, 2, f"Title: {self.title[:w - 11]}")
+            self.app.stdscr.attroff(curses.color_pair(COLOR_INFO) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        actions = self._actions()
+        y = 4
+        for i, (key, label) in enumerate(actions):
+            if y >= h - 5:
+                break
+            prefix = "▶ " if i == self.idx else "  "
+            color = COLOR_SEL if i == self.idx else COLOR_MENU
+            if key == "video" and not self.has_gui:
+                color = COLOR_INFO
+            try:
+                self.app.stdscr.attron(curses.color_pair(color))
+                self.app.stdscr.addstr(y, 3, f"{prefix}{label}"[:w - 6])
+                self.app.stdscr.attroff(curses.color_pair(color))
+            except curses.error:
+                pass
+            y += 1
+
+        # Player status
+        st, p_title, p_mode, p_err = self.app.player.state_snapshot()
+        y += 1
+        if st != "idle":
+            if st == "error":
+                st_line = f"Player Error: {p_err}"
+                st_color = COLOR_ERROR
+            elif st == "loading":
+                st_line = f"⏳ Buffering stream ({p_mode}): {p_title}"
+                st_color = COLOR_INFO
+            elif st == "paused":
+                st_line = f"⏸ Paused ({p_mode}): {p_title}"
+                st_color = COLOR_SEL
+            else:
+                st_line = f"▶ Playing ({p_mode}): {p_title}"
+                st_color = COLOR_PROGRESS
+            try:
+                self.app.stdscr.attron(curses.color_pair(st_color))
+                self.app.stdscr.addstr(y, 3, st_line[:w - 6])
+                self.app.stdscr.attroff(curses.color_pair(st_color))
+            except curses.error:
+                pass
+            y += 1
+
+        if self.msg:
+            try:
+                self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
+                self.app.stdscr.addstr(h - 4, 2, self.msg[:w - 4])
+                self.app.stdscr.attroff(curses.color_pair(COLOR_INFO))
+            except curses.error:
+                pass
+
+        self.draw_status("↑/↓ select  Enter run  ←/→/Tab switch  Space pause  0 restart  s stop  r rescan  Esc back")
+
+    def handle_key(self, key):
+        actions = self._actions()
+        if key == 27:
+            self.app.pop_screen()
+        elif key == curses.KEY_UP:
+            self.idx = max(0, self.idx - 1)
+        elif key == curses.KEY_DOWN:
+            self.idx = min(len(actions) - 1, self.idx + 1)
+        elif key in (curses.KEY_RIGHT, 9):  # Right or Tab cycles selected option/sink
+            act, _ = actions[self.idx]
+            if act == "quality":
+                self.fmt_idx = (self.fmt_idx + 1) % len(self.presets)
+                self._save_format()
+            elif self.outputs:
+                self.out_idx = (self.out_idx + 1) % len(self.outputs)
+                self._save_sink()
+        elif key == curses.KEY_LEFT:
+            act, _ = actions[self.idx]
+            if act == "quality":
+                self.fmt_idx = (self.fmt_idx - 1) % len(self.presets)
+                self._save_format()
+            elif self.outputs:
+                self.out_idx = (self.out_idx - 1) % len(self.outputs)
+                self._save_sink()
+        elif key in (ord("r"), ord("R")):
+            self.outputs = detect_audio_outputs()
+            self.out_idx = 0
+            self.msg = f"Detected {len(self.outputs)} audio output(s)."
+        elif key == ord(" "):
+            ok, st = self.app.player.toggle_pause()
+            self.msg = f"Playback {st}" if ok else st
+        elif key == ord("0"):
+            ok, msg = self.app.player.restart()
+            self.msg = msg
+        elif key in (ord("s"), ord("S")):
+            self.app.player.stop()
+            self.msg = "Playback stopped."
+        elif key in (curses.KEY_ENTER, 10, 13):
+            act, _ = actions[self.idx]
+            if act == "quality":
+                self.fmt_idx = (self.fmt_idx + 1) % len(self.presets)
+                self._save_format()
+                return
+            if act == "sink":
+                if self.outputs:
+                    self.out_idx = (self.out_idx + 1) % len(self.outputs)
+                    self._save_sink()
+                return
+            if act == "browser":
+                ok, note = play_media(self.url)
+                self.msg = note if ok else f"Browser failed: {note}"
+                return
+            if act == "video" and not self.has_gui:
+                self.msg = "Video unavailable: headless environment (no Wayland/X11)."
+                return
+            lbl, backend, dev = self.outputs[self.out_idx] if self.outputs else ("Default", "auto", "auto")
+            _flbl, fexpr = self.presets[self.fmt_idx]
+            self.app.player.start(self.url, self.title, mode=act, backend=backend, device=dev, output_label=lbl, fmt=fexpr)
+            self.msg = f"Starting {act} ({_flbl}) on {lbl}…"
+
+    def _save_format(self):
+        try:
+            _lbl, fexpr = self.presets[self.fmt_idx]
+            self.app.config["play_format"] = fexpr
+        except Exception:
+            pass
+
+    def _save_sink(self):
+        try:
+            _lbl, _be, dev = self.outputs[self.out_idx]
+            self.app.config["audio_output"] = dev
+        except Exception:
+            pass
+
+
+def sanitize_filename(name, max_len=80):
+    """Bersihkan string untuk jadi nama folder/file, ganti spasi dgn underscore."""
+    if not name:
+        return "untitled"
+    # Hanya允许 alfanumerik, spasi, underscore, strip, hyphen
+    clean = re.sub(r'[^\w\s\-]', '', name).strip()
+    clean = re.sub(r'\s+', '_', clean)
+    clean = clean[:max_len].rstrip('_') or "untitled"
+    return clean
+
+
+def normalize_url(url):
+    """Konversi YouTube Music URL (music.youtube.com) ke www.youtube.com biasa."""
+    if not url:
+        return url
+    # music.youtube.com/watch?v=XXX → www.youtube.com/watch?v=XXX
+    # music.youtube.com/playlist?list=XXX → www.youtube.com/playlist?list=XXX
+    url = url.replace("music.youtube.com", "www.youtube.com")
+    # Juga handle youtube.com tanpa www
+    if "://youtube.com/" in url:
+        url = url.replace("://youtube.com/", "://www.youtube.com/")
+    return url
+
+
+def fmt_time(ts_str):
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        return dt.strftime("%d %b %H:%M")
+    except (ValueError, TypeError):
+        return ts_str
+
 
 
 class MainMenu(Screen):
@@ -588,6 +1226,7 @@ class SearchInput(Screen):
         self.play_msg = ""  # last play feedback (shown in stats line)
         self.error = ""
         self.msg = ""
+        self.hist_idx = -1
 
     def visible(self):
         """Results for the current view (videos or playlists)."""
@@ -639,25 +1278,44 @@ class SearchInput(Screen):
             return
 
         # mode == "input"
-        lines = [
-            "Search YouTube videos & playlists. Results via yt-dlp.",
-            "",
-            "Search: " + self.query + ("█" if len(self.query) < w - 10 else ""),
-        ]
-        if self.msg:
-            lines.append("")
-            lines.append(self.msg)
+        recent = self.app.search_history.get_recent()
+        y_base = 3
+        try:
+            self.app.stdscr.attron(curses.color_pair(COLOR_MENU))
+            self.app.stdscr.addstr(y_base, 4, "Search YouTube videos & playlists. Results via yt-dlp."[: w - 8])
+            self.app.stdscr.addstr(y_base + 2, 4, ("Search: " + self.query + ("█" if len(self.query) < w - 14 else ""))[: w - 8])
+            self.app.stdscr.attroff(curses.color_pair(COLOR_MENU))
+        except curses.error:
+            pass
 
-        for i, line in enumerate(lines):
+        if self.msg:
             try:
-                attr = curses.color_pair(COLOR_ERROR) if self.msg and i == len(lines) - 1 else curses.color_pair(COLOR_MENU)
-                self.app.stdscr.attron(attr)
-                self.app.stdscr.addstr(h // 2 - 2 + i, 4, line[: w - 8])
-                self.app.stdscr.attroff(attr)
+                self.app.stdscr.attron(curses.color_pair(COLOR_ERROR))
+                self.app.stdscr.addstr(y_base + 4, 4, self.msg[: w - 8])
+                self.app.stdscr.attroff(curses.color_pair(COLOR_ERROR))
             except curses.error:
                 pass
 
-        self.draw_status("Enter search  Esc back  Ctrl+U clear")
+        if recent:
+            hdr_y = y_base + 6
+            try:
+                self.app.stdscr.attron(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
+                self.app.stdscr.addstr(hdr_y, 4, f"Recent Searches ({len(recent)} — ↑/↓ pick, Ctrl+L clear):"[: w - 8])
+                self.app.stdscr.attroff(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
+            except curses.error:
+                pass
+            max_show = max(0, h - hdr_y - 4)
+            for i, q in enumerate(recent[:max_show]):
+                prefix = "▶ " if i == self.hist_idx else "  "
+                color = COLOR_SEL if i == self.hist_idx else COLOR_INFO
+                try:
+                    self.app.stdscr.attron(curses.color_pair(color))
+                    self.app.stdscr.addstr(hdr_y + 1 + i, 4, f"{prefix}{q}"[: w - 8])
+                    self.app.stdscr.attroff(curses.color_pair(color))
+                except curses.error:
+                    pass
+
+        self.draw_status("Enter search  ↑/↓ history  Ctrl+U clear input  Ctrl+L clear history  Esc back")
 
     def _render_results(self, h, w):
         items = self.visible()
@@ -739,6 +1397,16 @@ class SearchInput(Screen):
                 stats = f" {self.load_err[:w-6]}"
             if self.play_msg:
                 stats = f" {self.play_msg[:w-6]}"
+            else:
+                st, p_title, _p_mode, p_err = self.app.player.state_snapshot()
+                if st == "playing":
+                    stats = f" ▶ Playing: {p_title[:w-20]}"
+                elif st == "paused":
+                    stats = f" ⏸ Paused: {p_title[:w-19]}"
+                elif st == "loading":
+                    stats = f" ⏳ Buffering: {p_title[:w-22]}"
+                elif st == "error" and p_err:
+                    stats = f" ✗ Play error: {p_err[:w-22]}"
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
             self.app.stdscr.addstr(h - 3, 2, stats[:w - 4])
@@ -751,7 +1419,7 @@ class SearchInput(Screen):
             self.draw_status("Press Esc to go back")
             return
 
-        self.draw_status("↑/↓ move  PgUp/PgDn page  Tab V/P  p play  Enter select  n new  Esc")
+        self.draw_status("↑/↓ move  PgUp/PgDn page  Tab V/P  p play  Space pause  s stop  Enter select  Esc")
 
     def handle_key(self, key):
         if self.mode == "loading":
@@ -765,18 +1433,38 @@ class SearchInput(Screen):
             return
 
         # mode == "input"
+        recent = self.app.search_history.get_recent()
         if key == 27:
             self.app.pop_screen()
         elif key == 21:  # Ctrl+U
             self.query = ""
+            self.hist_idx = -1
+            self.msg = ""
+        elif key == 12:  # Ctrl+L: clear search history
+            self.app.search_history.clear()
+            self.hist_idx = -1
+            self.msg = "Search history cleared."
+        elif key == curses.KEY_UP and recent:
+            self.hist_idx = min(len(recent) - 1, self.hist_idx + 1)
+            self.query = recent[self.hist_idx]
+            self.msg = ""
+        elif key == curses.KEY_DOWN and recent:
+            if self.hist_idx > 0:
+                self.hist_idx -= 1
+                self.query = recent[self.hist_idx]
+            elif self.hist_idx == 0:
+                self.hist_idx = -1
+                self.query = ""
             self.msg = ""
         elif key in (curses.KEY_ENTER, 10, 13):
             if self.query.strip():
+                self.hist_idx = -1
                 self._do_search()
             else:
                 self.msg = "Query cannot be empty!"
         elif key == curses.KEY_BACKSPACE or key == 127:
             self.query = self.query[:-1]
+            self.hist_idx = -1
             self.msg = ""
         elif key == 22:  # Ctrl+V
             clipboard = shutil.which("termux-clipboard-get")
@@ -817,13 +1505,19 @@ class SearchInput(Screen):
             self.more_playlists = False
         elif key in (ord("t"), ord("T"), 9):  # t / Tab: Videos <-> Playlists
             self.toggle_view()
-        elif key in (ord("p"), ord("P")):  # play highlighted item externally
+        elif key in (ord("p"), ord("P")):  # open playback options for highlighted item
             if items and 0 <= self.idx < len(items):
                 sel = items[self.idx]
-                ok, note = play_media(sel.get("url", ""))
-                title = (sel.get("title") or "?")[:40]
-                self.play_msg = f"{note} {title}" if ok \
-                    else f"Can't play: {note}"
+                self.app.push_screen(PlayOptionsScreen(self.app, sel))
+        elif key == ord(" "):
+            ok, st = self.app.player.toggle_pause()
+            self.play_msg = f"Playback {st}" if ok else st
+        elif key == ord("0"):
+            ok, msg = self.app.player.restart()
+            self.play_msg = msg
+        elif key in (ord("s"), ord("S")):
+            self.app.player.stop()
+            self.play_msg = "Playback stopped."
         elif key == curses.KEY_UP:
             self.idx = max(0, self.idx - 1)
         elif key == curses.KEY_DOWN:
@@ -848,6 +1542,7 @@ class SearchInput(Screen):
                 self._load_more()
 
     def _do_search(self):
+        self.app.search_history.add(self.query)
         self.mode = "loading"
         self.error = ""
         self.results = []
@@ -2967,6 +3662,8 @@ class SettingsView(Screen):
             ("last_dir", "Default Download Directory", "path"),
             ("default_format", "Default Format String", "text"),
             ("max_history", "Max History Entries", "int"),
+            ("search_history_enabled", "Search History", "bool"),
+            ("max_search_history", "Max Search History Items", "int"),
             ("theme", "Color Theme", "choice", ["dark", "light"]),
         ]
         self.idx = 0
@@ -2989,6 +3686,9 @@ class SettingsView(Screen):
                 choices = field[3] if len(field) > 3 else []
                 # Show with < > brackets for toggle indicator
                 display = f" {label:<35}  <{val:^8}>  [Enter to toggle]"
+            elif ftype == "bool":
+                btxt = "on" if self.app.config[key] else "off"
+                display = f" {label:<35}  <{btxt:^8}>  [Enter to toggle]"
             else:
                 display = f" {label:<35} {val:<40}"
             attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if i == self.idx and not self.edit_mode else curses.color_pair(COLOR_MENU)
@@ -3061,6 +3761,11 @@ class SettingsView(Screen):
                 # Toggle theme directly
                 self.app.toggle_theme()
                 self.success_msg = f" ✓ Theme: {self.app.config['theme']}"
+            elif ftype == "bool":
+                new_val = not bool(self.app.config[key_name])
+                self.app.config[key_name] = new_val
+                self.app.config.save()
+                self.success_msg = f" ✓ {self.fields[self.idx][1]}: {'on' if new_val else 'off'}"
             else:
                 self.edit_field = self.fields[self.idx][1]
                 self.edit_value = str(self.app.config[key_name])
@@ -3128,11 +3833,68 @@ class HelpScreen(Screen):
         self.app.pop_screen()
 
 
+class SearchHistoryManager:
+    """Persists past search queries with configurable toggle and max-item limit."""
+
+    def __init__(self, config):
+        self.config = config
+        self.entries = []
+        self.load()
+
+    def load(self):
+        if SEARCH_HISTORY_FILE.exists():
+            try:
+                data = json.loads(SEARCH_HISTORY_FILE.read_text())
+                if isinstance(data, list):
+                    self.entries = [str(x) for x in data if str(x).strip()]
+            except Exception:
+                self.entries = []
+
+    def save(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            SEARCH_HISTORY_FILE.write_text(json.dumps(self.entries, indent=2))
+        except Exception:
+            pass
+
+    def enabled(self):
+        try:
+            return bool(self.config.data.get("search_history_enabled", True))
+        except Exception:
+            return True
+
+    def max_items(self):
+        try:
+            return max(1, int(self.config.data.get("max_search_history", 25)))
+        except Exception:
+            return 25
+
+    def add(self, query):
+        q = (query or "").strip()
+        if not q or not self.enabled():
+            return
+        self.entries = [e for e in self.entries if e != q]
+        self.entries.insert(0, q)
+        self.entries = self.entries[: self.max_items()]
+        self.save()
+
+    def get_recent(self):
+        if not self.enabled():
+            return []
+        return self.entries[: self.max_items()]
+
+    def clear(self):
+        self.entries = []
+        self.save()
+
+
 class App:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.config = ConfigManager()
         self.history = HistoryManager(self.config)
+        self.search_history = SearchHistoryManager(self.config)
+        self.player = PlaybackManager()
         self.screens = []
         self.running = True
         self.start_url = None
@@ -3171,6 +3933,10 @@ class App:
             except curses.error:
                 pass
         # Redraw current screen on next frame
+        try:
+            self.stdscr.bkgd(" ", curses.color_pair(COLOR_MENU))
+        except curses.error:
+            pass
         if self.screens:
             try:
                 self.stdscr.erase()
@@ -3204,49 +3970,55 @@ class App:
             pass
         last_id = id(self.screens[-1]) if self.screens else None
         last_state = self._screen_state(self.screens[-1]) if self.screens else None
-        while self.running:
-            try:
-                screen = self.screens[-1]
-                key = self.stdscr.getch()
-                if key != -1:  # key pressed: handle + repaint
-                    if key == curses.KEY_MOUSE:
-                        screen.handle_mouse()
-                    else:
-                        screen.handle_key(key)
-                    # screen may have changed after key handling
-                    screen = self.screens[-1] if self.screens else screen
-                    try:
-                        screen.render()
-                        self.stdscr.refresh()
-                    except curses.error:
-                        pass
-                    last_id = id(screen)
-                    last_state = self._screen_state(screen)
-                else:
-                    cur_state = self._screen_state(screen)
-                    # Repaint if: screen pushed/popped, busy-mode changed
-                    # (background thread finished search/fetch), or active
-                    # spinner/progress needs its tick. Otherwise stay still
-                    # to avoid the 10fps full-clear flicker on Termux.
-                    if id(screen) != last_id or cur_state != last_state:
+        try:
+            while self.running:
+                try:
+                    screen = self.screens[-1]
+                    key = self.stdscr.getch()
+                    if key != -1:  # key pressed: handle + repaint
+                        if key == curses.KEY_MOUSE:
+                            screen.handle_mouse()
+                        else:
+                            screen.handle_key(key)
+                        # screen may have changed after key handling
+                        screen = self.screens[-1] if self.screens else screen
                         try:
                             screen.render()
                             self.stdscr.refresh()
                         except curses.error:
                             pass
                         last_id = id(screen)
-                        last_state = cur_state
-                    elif screen.needs_animation():
-                        try:
-                            screen.render()
-                            self.stdscr.refresh()
-                        except curses.error:
-                            pass
-                        self.spinner_count += 1
-                # idle static screen + no key + no change: do nothing
-            except KeyboardInterrupt:
-                self.running = False
-            except curses.error:
+                        last_state = self._screen_state(screen)
+                    else:
+                        cur_state = self._screen_state(screen)
+                        # Repaint if: screen pushed/popped, busy-mode changed
+                        # (background thread finished search/fetch), or active
+                        # spinner/progress needs its tick. Otherwise stay still
+                        # to avoid the 10fps full-clear flicker on Termux.
+                        if id(screen) != last_id or cur_state != last_state:
+                            try:
+                                screen.render()
+                                self.stdscr.refresh()
+                            except curses.error:
+                                pass
+                            last_id = id(screen)
+                            last_state = cur_state
+                        elif screen.needs_animation():
+                            try:
+                                screen.render()
+                                self.stdscr.refresh()
+                            except curses.error:
+                                pass
+                            self.spinner_count += 1
+                    # idle static screen + no key + no change: do nothing
+                except KeyboardInterrupt:
+                    self.running = False
+                except curses.error:
+                    pass
+        finally:
+            try:
+                self.player.stop()
+            except Exception:
                 pass
 
     def _screen_state(self, screen):
@@ -3260,6 +4032,7 @@ class App:
             getattr(screen, "msg", None),
             getattr(screen, "error", None),
             getattr(screen, "view", None),
+            self.player.state_snapshot(),
         )
 
 

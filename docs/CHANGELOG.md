@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.0 (2026-11-20)
+
+### Features
+
+- **Interactive Terminal & Browser Playback (`PlayOptionsScreen`):** Pressing `p` on a search result now lets you choose between **Play Audio Only (Terminal)**, **Play Video + Audio (`mpv`)**, and **Open in Default Web Browser**.
+- **Audio Output Detection:** Uses PipeWire/PulseAudio default or enumerated `pactl` sinks when active, and falls back to detecting **BlueALSA** Bluetooth sinks (`bluealsa-cli`) and **ALSA** PCM devices (`aplay -L`) on headless setups.
+- **Playback Controls & Live Streams:** Added `PlaybackManager` supporting `mpv` (with JSON IPC) and `yt-dlp` + `ffmpeg` + `aplay` fallback, **Pause/Resume (`Space`)**, **Restart from `0:00` (`0`)**, **Stop (`s`)**, and live stream playback (`-reconnect`).
+- **Pre-Playback Quality / Codec Selector:** Cycle presets (`Best Available (DASH/HLS)`, `1080p`, `720p`, `480p`, `Best Audio`, `Opus`, `AAC`) in `PlayOptionsScreen` (persisted in `play_format`).
+- **Headless Video Guard:** Automatically disables video playback when neither `WAYLAND_DISPLAY` nor `DISPLAY` is set on Linux.
+- **Search History:** Persists past search queries in `~/.config/yt-tui/search_history.json` (`↑`/`↓` to recall, `Ctrl+L` to clear), with **Search History** (`on`/`off`) and **Max Search History Items** configurable in **Settings**.
+
+### Bug Fixes
+
+- **Light Theme Contrast:** Updated `THEME_LIGHT` to use explicit `COLOR_WHITE` background with `stdscr.bkgd()`, fixing invisible black-on-black text on dark terminals.
+- **Fresh Playback Start:** Added `--no-resume-playback` to `mpv` so tracks start from `0:00` instead of resuming from `watch_later`.
+
 ## v1.0.1 (2026-07-28)
 
 ### Bug Fixes
