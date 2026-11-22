@@ -31,10 +31,13 @@ def debug_log(msg):
     except Exception:
         pass
 
+APP_VERSION = "1.2.1"
 CONFIG_DIR = Path.home() / ".config" / "yt-tui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 SEARCH_HISTORY_FILE = CONFIG_DIR / "search_history.json"
+SEARCH_CACHE_FILE = CONFIG_DIR / "search_cache.json"
+SEARCH_CACHE_TTL = 7200  # 2 hours in seconds
 
 DEFAULT_CONFIG = {
     "last_dir": "/sdcard/Download",
@@ -45,6 +48,7 @@ DEFAULT_CONFIG = {
     "play_format": "bestvideo+bestaudio/best",
     "search_history_enabled": True,
     "max_search_history": 25,
+    "use_js_runtime": True,
 }
 
 PLAY_QUALITY_PRESETS = [
@@ -364,7 +368,8 @@ def detect_audio_outputs():
     except Exception:
         pass
 
-    # Non-Pulse/PipeWire (e.g. headless ALSA / BlueALSA)
+    # Non-Pulse/PipeWire (e.g. headless ALSA / BlueALSA / dmix)
+    _add("Default (ALSA)", "alsa", "default")
     if shutil.which("bluealsa-cli"):
         try:
             out = subprocess.check_output(
@@ -426,6 +431,103 @@ def detect_audio_outputs():
     if not outputs:
         _add("System Default (ALSA)", "alsa", "default")
     return outputs
+
+
+def adjust_output_volume(backend, device, delta_pct=5):
+    """Adjust volume for the chosen output (Pulse/PipeWire, BlueALSA, or ALSA)."""
+    sign = "+" if delta_pct >= 0 else "-"
+    abs_pct = abs(int(delta_pct))
+
+    if backend == "pulse" and shutil.which("pactl"):
+        sink = "@DEFAULT_SINK@" if (not device or device == "auto") else device
+        try:
+            subprocess.run(
+                ["pactl", "set-sink-volume", sink, f"{sign}{abs_pct}%"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            out = subprocess.check_output(
+                ["pactl", "get-sink-volume", sink],
+                stderr=subprocess.DEVNULL, timeout=2,
+            ).decode(errors="replace")
+            m = re.search(r"(\d+)%", out)
+            return True, f"Volume: {m.group(1)}%" if m else f"Volume {sign}{abs_pct}%"
+        except Exception as e:
+            return False, f"Volume error: {e}"
+
+    if shutil.which("bluealsa-cli") and (
+        (device and device.startswith("bluealsa:")) or backend == "alsa"
+    ):
+        try:
+            pcms = subprocess.check_output(
+                ["bluealsa-cli", "list-pcms"],
+                stderr=subprocess.DEVNULL, timeout=2,
+            ).decode(errors="replace").splitlines()
+            pcm = ""
+            if device and device.startswith("bluealsa:"):
+                m_dev = re.search(r"DEV=([0-9A-Fa-f:]{17})", device)
+                if m_dev:
+                    pat = "dev_" + m_dev.group(1).replace(":", "_")
+                    for line in pcms:
+                        if pat.lower() in line.lower() and "sink" in line:
+                            pcm = line.strip()
+                            break
+            if not pcm:
+                for line in pcms:
+                    if "a2dpsrc/sink" in line or "scosrc/sink" in line:
+                        pcm = line.strip()
+                        break
+            if pcm:
+                vol_out = subprocess.check_output(
+                    ["bluealsa-cli", "volume", pcm],
+                    stderr=subprocess.DEVNULL, timeout=2,
+                ).decode(errors="replace")
+                nums = re.findall(r"\b(\d+)\b", vol_out)
+                cur = int(nums[-1]) if nums else 64
+                step = max(1, round(127 * abs_pct / 100))
+                new_v = max(0, min(127, cur + (step if delta_pct >= 0 else -step)))
+                subprocess.run(
+                    ["bluealsa-cli", "volume", pcm, str(new_v), str(new_v)],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+                )
+                return True, f"Bluetooth Volume: {round(new_v * 100 / 127)}%"
+        except Exception:
+            if device and device.startswith("bluealsa:"):
+                return False, "BlueALSA volume control failed."
+
+    if shutil.which("amixer"):
+        for ctl in ("Master", "PCM"):
+            try:
+                out = subprocess.check_output(
+                    ["amixer", "sset", ctl, f"{abs_pct}%{sign}"],
+                    stderr=subprocess.DEVNULL, timeout=2,
+                ).decode(errors="replace")
+                m = re.search(r"\[(\d+)%\]", out)
+                return True, f"ALSA {ctl}: {m.group(1)}%" if m else f"ALSA {ctl} {sign}{abs_pct}%"
+            except Exception:
+                continue
+
+    return False, "No mixer control available for this output."
+
+
+_YTDLP_LOCK = threading.Lock()
+_YTDLP_MOD = None
+_YTDLP_TRIED = False
+
+
+def get_ytdlp_module():
+    """Import and cache yt_dlp in-process (thread-safe). Returns module or None."""
+    global _YTDLP_MOD, _YTDLP_TRIED
+    if _YTDLP_TRIED:
+        return _YTDLP_MOD
+    with _YTDLP_LOCK:
+        if not _YTDLP_TRIED:
+            try:
+                import yt_dlp as _ydl
+                _YTDLP_MOD = _ydl
+            except Exception:
+                _YTDLP_MOD = None
+            _YTDLP_TRIED = True
+    return _YTDLP_MOD
 
 
 class PlaybackManager:
@@ -528,7 +630,7 @@ class PlaybackManager:
         with self._lock:
             return (self.state, self.title, self.mode, self.error_msg)
 
-    def start(self, url, title, mode="audio", backend="auto", device="auto", output_label="", fmt=None):
+    def start(self, url, title, mode="audio", backend="auto", device="auto", output_label="", fmt=None, use_js_runtime=True):
         if not url:
             with self._lock:
                 self.state = "error"
@@ -544,7 +646,7 @@ class PlaybackManager:
         with self._lock:
             self._gen += 1
             gen = self._gen
-            self._last_args = (url, title, mode, backend, device, output_label, fmt)
+            self._last_args = (url, title, mode, backend, device, output_label, fmt, use_js_runtime)
             self.state = "loading"
             self.title = title or url
             self.url = url
@@ -554,12 +656,12 @@ class PlaybackManager:
 
         t = threading.Thread(
             target=self._run_worker,
-            args=(gen, url, mode, backend, device, fmt),
+            args=(gen, url, mode, backend, device, fmt, use_js_runtime),
             daemon=True,
         )
         t.start()
 
-    def _run_worker(self, gen, url, mode, backend, device, fmt=None):
+    def _run_worker(self, gen, url, mode, backend, device, fmt=None, use_js_runtime=True):
         try:
             mpv_bin = shutil.which("mpv")
             if mode == "video" and not mpv_bin:
@@ -570,16 +672,27 @@ class PlaybackManager:
                 return
 
             if mpv_bin:
-                rc = self._run_mpv(gen, mpv_bin, url, mode, backend, device, fmt)
+                rc = self._run_mpv(gen, mpv_bin, url, mode, backend, device, fmt, use_js_runtime)
                 if rc == 127 and mode == "audio":
-                    # mpv failed due to missing shared lib; fall back to ffmpeg+aplay
+                    # mpv failed due to missing shared lib; fall back to ffmpeg+aplay/paplay
                     with self._lock:
                         if self._gen == gen:
                             self.state = "loading"
                             self.error_msg = ""
-                    self._run_ffmpeg_alsa(gen, url, device, fmt)
+                    self._run_ffmpeg_alsa(gen, url, backend, device, fmt, use_js_runtime)
             else:
-                self._run_ffmpeg_alsa(gen, url, device, fmt)
+                self._run_ffmpeg_alsa(gen, url, backend, device, fmt, use_js_runtime)
+        except subprocess.TimeoutExpired:
+            with self._lock:
+                if self._gen == gen:
+                    self.state = "error"
+                    self.error_msg = "yt-dlp timed out (try disabling JS Runtime in Settings)."
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode(errors="replace").strip().splitlines()
+            with self._lock:
+                if self._gen == gen:
+                    self.state = "error"
+                    self.error_msg = (err[-1] if err else f"yt-dlp failed ({e.returncode})")[:80]
         except Exception as e:
             debug_log(f"Playback worker error: {e}")
             with self._lock:
@@ -587,7 +700,7 @@ class PlaybackManager:
                     self.state = "error"
                     self.error_msg = str(e)[:80]
 
-    def _run_mpv(self, gen, mpv_bin, url, mode, backend, device, fmt=None):
+    def _run_mpv(self, gen, mpv_bin, url, mode, backend, device, fmt=None, use_js_runtime=True):
         sock_path = f"/tmp/yt-tui-mpv-{os.getpid()}-{gen}.sock"
         cmd = [
             mpv_bin,
@@ -596,6 +709,8 @@ class PlaybackManager:
             f"--input-ipc-server={sock_path}",
             "--ytdl=yes",
         ]
+        if not use_js_runtime:
+            cmd.append("--ytdl-raw-options=no-js-runtimes=")
         if mode == "audio":
             ytdl_fmt = fmt if (fmt and "bestaudio" in fmt) else "bestaudio/best"
             cmd.extend(["--no-video", f"--ytdl-format={ytdl_fmt}"])
@@ -652,22 +767,52 @@ class PlaybackManager:
             pass
         return proc.returncode
 
-    def _run_ffmpeg_alsa(self, gen, url, device, fmt=None):
+    def _run_ffmpeg_alsa(self, gen, url, backend, device, fmt=None, use_js_runtime=True):
         ffmpeg_bin = shutil.which("ffmpeg")
+        paplay_bin = shutil.which("paplay") if backend == "pulse" else None
         aplay_bin = shutil.which("aplay")
-        if not ffmpeg_bin or not aplay_bin:
+        if not ffmpeg_bin or (not paplay_bin and not aplay_bin):
             with self._lock:
                 if self._gen == gen:
                     self.state = "error"
-                    self.error_msg = "Need mpv, or ffmpeg + aplay for audio playback."
+                    self.error_msg = "Need mpv, or ffmpeg + paplay/aplay for audio playback."
             return
 
-        ytdl_fmt = fmt if (fmt and "bestaudio" in fmt) else "bestaudio/best"
-        stream_url = subprocess.check_output(
-            ["yt-dlp", "-g", "-f", ytdl_fmt, "--no-playlist", url],
-            stderr=subprocess.PIPE,
-            timeout=20,
-        ).decode(errors="replace").strip().splitlines()[0]
+        is_audio_only_fmt = bool(
+            fmt and "bestaudio" in fmt and "bestvideo" not in fmt and "bv" not in fmt and "height" not in fmt
+        )
+        ytdl_fmt = fmt if is_audio_only_fmt else "bestaudio/best"
+        stream_url = ""
+        http_headers = {}
+        ydl_mod = get_ytdlp_module()
+        if ydl_mod is not None:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "format": ytdl_fmt,
+                "noplaylist": True,
+            }
+            if not use_js_runtime:
+                opts["js_runtimes"] = {}
+            with ydl_mod.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            stream_url = info.get("url") or ""
+            http_headers = info.get("http_headers") or {}
+            if not stream_url:
+                req = info.get("requested_formats") or []
+                if req and isinstance(req[0], dict):
+                    stream_url = req[0].get("url", "")
+                    http_headers = req[0].get("http_headers") or http_headers
+        if not stream_url:
+            yt_cmd = ["yt-dlp", "-g", "-f", ytdl_fmt, "--no-playlist"]
+            if not use_js_runtime:
+                yt_cmd.append("--no-js-runtimes")
+            yt_cmd.append(url)
+            stream_url = subprocess.check_output(
+                yt_cmd,
+                stderr=subprocess.PIPE,
+                timeout=150,
+            ).decode(errors="replace").strip().splitlines()[0]
 
         ff_cmd = [
             ffmpeg_bin,
@@ -675,36 +820,63 @@ class PlaybackManager:
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
+        ]
+        ua = http_headers.get("User-Agent") if isinstance(http_headers, dict) else None
+        if ua:
+            ff_cmd.extend(["-user_agent", ua])
+        if isinstance(http_headers, dict):
+            hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items() if k.lower() != "user-agent")
+            if hdr_lines:
+                ff_cmd.extend(["-headers", hdr_lines])
+        ff_cmd.extend([
             "-i", stream_url,
             "-vn",
             "-f", "s16le",
             "-ac", "2",
             "-ar", "48000",
             "pipe:1",
-        ]
-        alsa_dev = device if (device and device != "auto") else "default"
-        ap_cmd = [
-            aplay_bin,
-            "-q",
-            "-D", alsa_dev,
-            "-f", "S16_LE",
-            "-r", "48000",
-            "-c", "2",
-            "-t", "raw",
-        ]
+        ])
+        ap_env = None
+        if paplay_bin:
+            ap_cmd = [
+                paplay_bin,
+                "--raw",
+                "--format=s16le",
+                "--rate=48000",
+                "--channels=2",
+                "--client-name=yt-tui",
+                "--stream-name=yt-tui",
+            ]
+            if device and device != "auto":
+                ap_cmd.append(f"--device={device}")
+        else:
+            alsa_dev = "default" if backend == "pulse" else (device if (device and device != "auto") else "default")
+            ap_cmd = [
+                aplay_bin,
+                "-q",
+                "-D", alsa_dev,
+                "-f", "S16_LE",
+                "-r", "48000",
+                "-c", "2",
+                "-t", "raw",
+            ]
+            if backend == "pulse" and device and device != "auto":
+                ap_env = os.environ.copy()
+                ap_env["PULSE_SINK"] = device
 
         ff_proc = subprocess.Popen(
             ff_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
+            preexec_fn=lambda: os.setpgid(0, 0),
         )
         ap_proc = subprocess.Popen(
             ap_cmd,
             stdin=ff_proc.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=ap_env,
             preexec_fn=lambda: os.setpgid(0, ff_proc.pid),
         )
         if ff_proc.stdout:
@@ -723,6 +895,12 @@ class PlaybackManager:
             self._save_state()
 
         _, ap_err = ap_proc.communicate()
+        ff_err = b""
+        try:
+            if ff_proc.stderr:
+                ff_err = ff_proc.stderr.read()
+        except Exception:
+            pass
         ff_proc.wait()
         with self._lock:
             if self._gen == gen:
@@ -730,6 +908,10 @@ class PlaybackManager:
                     err = (ap_err or b"").decode(errors="replace").strip()
                     self.state = "error"
                     self.error_msg = (err or f"aplay exited ({ap_proc.returncode})")[:80]
+                elif ff_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
+                    err = (ff_err or b"").decode(errors="replace").strip().splitlines()
+                    self.state = "error"
+                    self.error_msg = (err[-1] if err else f"ffmpeg exited ({ff_proc.returncode})")[:80]
                 else:
                     self.state = "idle"
                 self._procs = []
@@ -878,7 +1060,7 @@ class Screen:
 
     def draw_title(self, text):
         h, w = self.app.stdscr.getmaxyx()
-        title = f" \u2500\u2500 yt-tui v1.0: {text} "
+        title = f" \u2500\u2500 yt-tui v{APP_VERSION}: {text} "
         pad = w - len(title) - 2
         if pad < 0:
             title = title[:w - 4]
@@ -1036,7 +1218,7 @@ class PlayOptionsScreen(Screen):
             except curses.error:
                 pass
 
-        self.draw_status("↑/↓ select  Enter run  ←/→/Tab switch  Space pause  0 restart  s stop  r rescan  Esc back")
+        self.draw_status("↑/↓ select  Enter run  ←/→/Tab switch  +/- vol  Space pause  0 restart  s stop  r rescan  Esc back")
 
     def handle_key(self, key):
         actions = self._actions()
@@ -1066,6 +1248,14 @@ class PlayOptionsScreen(Screen):
             self.outputs = detect_audio_outputs()
             self.out_idx = 0
             self.msg = f"Detected {len(self.outputs)} audio output(s)."
+        elif key in (ord("+"), ord("=")):
+            _lbl, backend, dev = self.outputs[self.out_idx] if self.outputs else ("Default", "auto", "auto")
+            _ok, vmsg = adjust_output_volume(backend, dev, +5)
+            self.msg = vmsg
+        elif key in (ord("-"), ord("_")):
+            _lbl, backend, dev = self.outputs[self.out_idx] if self.outputs else ("Default", "auto", "auto")
+            _ok, vmsg = adjust_output_volume(backend, dev, -5)
+            self.msg = vmsg
         elif key == ord(" "):
             ok, st = self.app.player.toggle_pause()
             self.msg = f"Playback {st}" if ok else st
@@ -1095,7 +1285,11 @@ class PlayOptionsScreen(Screen):
                 return
             lbl, backend, dev = self.outputs[self.out_idx] if self.outputs else ("Default", "auto", "auto")
             _flbl, fexpr = self.presets[self.fmt_idx]
-            self.app.player.start(self.url, self.title, mode=act, backend=backend, device=dev, output_label=lbl, fmt=fexpr)
+            use_js = bool(self.app.config["use_js_runtime"]) if "use_js_runtime" in self.app.config.data else True
+            self.app.player.start(
+                self.url, self.title, mode=act, backend=backend, device=dev,
+                output_label=lbl, fmt=fexpr, use_js_runtime=use_js,
+            )
             self.msg = f"Starting {act} ({_flbl}) on {lbl}…"
 
     def _save_format(self):
@@ -1168,8 +1362,8 @@ class MainMenu(Screen):
 
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
-            self.app.stdscr.addstr(4, cx("\u2500\u2500 yt-tui v1.0 \u2500\u2500"),
-                                   "\u2500\u2500 yt-tui v1.0 \u2500\u2500"[:w-2])
+            self.app.stdscr.addstr(4, cx(f"\u2500\u2500 yt-tui v{APP_VERSION} \u2500\u2500"),
+                                   f"\u2500\u2500 yt-tui v{APP_VERSION} \u2500\u2500"[:w-2])
             self.app.stdscr.attroff(curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
             self.app.stdscr.attron(curses.color_pair(COLOR_TITLE))
             self.app.stdscr.addstr(5, cx("yt-dlp Terminal UI"), "yt-dlp Terminal UI"[:w-2])
@@ -1650,7 +1844,7 @@ class SearchInput(Screen):
 
     def _do_search(self):
         self.app.search_history.add(self.query)
-        self.mode = "loading"
+        search_q = self.query.strip()
         self.error = ""
         self.results = []
         self.idx = 0
@@ -1662,9 +1856,20 @@ class SearchInput(Screen):
         self.load_err = ""
         self.play_msg = ""
 
+        cached = self.app.search_cache.get(search_q)
+        if cached is not None:
+            c_results, c_more_v, c_more_p = cached
+            self.results = list(c_results)
+            self.more_videos = bool(c_more_v)
+            self.more_playlists = bool(c_more_p)
+            self.play_msg = "Loaded from 2h cache"
+            self.mode = "results"
+            return
+
+        self.mode = "loading"
+
         def run():
             try:
-                search_q = self.query.strip()
                 limit = self.SEARCH_LIMIT
                 vids, vid_err = self._fetch_videos(search_q, limit)
                 pls, pl_err = self._fetch_playlists(search_q, 1, limit)
@@ -1682,6 +1887,7 @@ class SearchInput(Screen):
                                 "or paste a URL directly.")
                     self.mode = "input"
                 else:
+                    self.app.search_cache.set(search_q, self.results, self.more_videos, self.more_playlists)
                     self.mode = "results"
             except FileNotFoundError:
                 self.error = "yt-dlp not found! Install with: pkg install yt-dlp"
@@ -1781,12 +1987,42 @@ class SearchInput(Screen):
                 continue
         return entries, ""
 
+    def _fetch_in_process(self, target, start=None, end=None):
+        """Use cached yt_dlp module when importable; returns (entries, err) or None."""
+        ydl_mod = get_ytdlp_module()
+        if ydl_mod is None:
+            return None
+        opts = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 15,
+            "retries": 2,
+        }
+        if start is not None:
+            opts["playliststart"] = start
+        if end is not None:
+            opts["playlistend"] = end
+        try:
+            with ydl_mod.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False) or {}
+            entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+            return entries, ""
+        except Exception as e:
+            return [], str(e)[:300]
+
     def _fetch_videos(self, search_q, limit):
+        res = self._fetch_in_process(f"ytsearch{limit}:{search_q}")
+        if res is not None:
+            return res
         return self._fetch_json(
             self._base_args() + [f"ytsearch{limit}:{search_q}"],
             timeout=60)
 
     def _fetch_playlists(self, search_q, start, end):
+        res = self._fetch_in_process(self._pl_url(search_q), start=start, end=end)
+        if res is not None:
+            return res
         return self._fetch_json(
             self._base_args() + ["--playlist-start", str(start),
                                  "--playlist-end", str(end),
@@ -2219,9 +2455,9 @@ class SubtitleSelector(Screen):
 
 
 class FolderBrowser(Screen):
-    def __init__(self, app, url, fmt, video_title, playlist_name=None,
+    def __init__(self, app, url="", fmt=None, video_title="", playlist_name=None,
                  playlist_videos=None, playlist_title="", mp3_mode=False,
-                 subtitle_langs=""):
+                 subtitle_langs="", on_select=None):
         super().__init__(app)
         self.url = url
         self.fmt = fmt
@@ -2231,7 +2467,11 @@ class FolderBrowser(Screen):
         self.playlist_title = playlist_title
         self.mp3_mode = mp3_mode
         self.subtitle_langs = subtitle_langs
-        self.current_path = app.config["last_dir"]
+        self.on_select = on_select
+        cur = app.config["last_dir"]
+        if not cur or not os.path.isdir(cur):
+            cur = str(Path.home())
+        self.current_path = cur
         self.entries = []
         self.idx = 0
         self.offset = 0
@@ -2274,8 +2514,11 @@ class FolderBrowser(Screen):
             pass
 
         try:
-            audio_tag = " +audio" if self.fmt.get("acodec", "") == "none" else ""
-            preview = f"Format: {self.fmt['id']}{audio_tag}  |  {self.video_title[:35]}"
+            if self.fmt:
+                audio_tag = " +audio" if self.fmt.get("acodec", "") == "none" else ""
+                preview = f"Format: {self.fmt['id']}{audio_tag}  |  {self.video_title[:35]}"
+            else:
+                preview = "Pick default download directory (press 'd' to select current folder)"
             self.app.stdscr.attron(curses.color_pair(COLOR_HEADER))
             self.app.stdscr.addstr(3, 0, f" {preview[:w-3]}")
             self.app.stdscr.attroff(curses.color_pair(COLOR_HEADER))
@@ -2408,6 +2651,10 @@ class FolderBrowser(Screen):
                     self.msg = f"Failed to create playlist folder: {e}"
                     return
             self.app.config["last_dir"] = path
+            if self.on_select:
+                self.on_select(path)
+                self.app.pop_screen()
+                return
             self.app.pop_screen()
             self.app.pop_screen()
             if self.playlist_videos:
@@ -3771,6 +4018,8 @@ class SettingsView(Screen):
             ("max_history", "Max History Entries", "int"),
             ("search_history_enabled", "Search History", "bool"),
             ("max_search_history", "Max Search History Items", "int"),
+            ("use_js_runtime", "yt-dlp JS Runtime", "bool"),
+            ("purge_search_cache", "Purge Search Cache (2h TTL)", "action"),
             ("theme", "Color Theme", "choice", ["dark", "light"]),
         ]
         self.idx = 0
@@ -3796,6 +4045,9 @@ class SettingsView(Screen):
             elif ftype == "bool":
                 btxt = "on" if self.app.config[key] else "off"
                 display = f" {label:<35}  <{btxt:^8}>  [Enter to toggle]"
+            elif ftype == "action":
+                cnt = self.app.search_cache.count()
+                display = f" {label:<35}  [{cnt} cached — Enter to purge]"
             else:
                 display = f" {label:<35} {val:<40}"
             attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if i == self.idx and not self.edit_mode else curses.color_pair(COLOR_MENU)
@@ -3873,6 +4125,15 @@ class SettingsView(Screen):
                 self.app.config[key_name] = new_val
                 self.app.config.save()
                 self.success_msg = f" ✓ {self.fields[self.idx][1]}: {'on' if new_val else 'off'}"
+            elif ftype == "action":
+                purged = self.app.search_cache.purge()
+                self.success_msg = f" ✓ Purged {purged} cached search(es)"
+            elif ftype == "path":
+                def _on_pick(picked_path):
+                    self.app.config[key_name] = picked_path
+                    self.app.config.save()
+                    self.success_msg = f" ✓ {self.fields[self.idx][1]}: {picked_path}"
+                self.app.push_screen(FolderBrowser(self.app, on_select=_on_pick))
             else:
                 self.edit_field = self.fields[self.idx][1]
                 self.edit_value = str(self.app.config[key_name])
@@ -3995,13 +4256,96 @@ class SearchHistoryManager:
         self.save()
 
 
+class SearchCacheManager:
+    """Caches search results on disk with a 2-hour TTL and manual purge."""
+
+    MAX_ENTRIES = 50
+
+    def __init__(self, ttl=SEARCH_CACHE_TTL):
+        self.ttl = ttl
+        self.cache = {}
+        self.load()
+
+    def load(self):
+        if SEARCH_CACHE_FILE.exists():
+            try:
+                data = json.loads(SEARCH_CACHE_FILE.read_text())
+                if isinstance(data, dict):
+                    self.cache = data
+            except Exception:
+                self.cache = {}
+
+    def save(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            SEARCH_CACHE_FILE.write_text(json.dumps(self.cache))
+        except Exception:
+            pass
+
+    def _prune(self):
+        now = time.time()
+        self.cache = {
+            k: v for k, v in self.cache.items()
+            if isinstance(v, dict) and (now - float(v.get("ts", 0))) < self.ttl
+        }
+        if len(self.cache) > self.MAX_ENTRIES:
+            ordered = sorted(self.cache.items(), key=lambda kv: float(kv[1].get("ts", 0)), reverse=True)
+            self.cache = dict(ordered[: self.MAX_ENTRIES])
+
+    def get(self, query):
+        key = (query or "").strip().lower()
+        if not key or key not in self.cache:
+            return None
+        entry = self.cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        if (time.time() - float(entry.get("ts", 0))) >= self.ttl:
+            self.cache.pop(key, None)
+            self.save()
+            return None
+        return (
+            entry.get("results", []),
+            entry.get("more_videos", False),
+            entry.get("more_playlists", False),
+        )
+
+    def set(self, query, results, more_videos=False, more_playlists=False):
+        key = (query or "").strip().lower()
+        if not key:
+            return
+        self.cache[key] = {
+            "ts": time.time(),
+            "results": list(results),
+            "more_videos": bool(more_videos),
+            "more_playlists": bool(more_playlists),
+        }
+        self._prune()
+        self.save()
+
+    def count(self):
+        self._prune()
+        return len(self.cache)
+
+    def purge(self):
+        n = len(self.cache)
+        self.cache = {}
+        try:
+            if SEARCH_CACHE_FILE.exists():
+                SEARCH_CACHE_FILE.unlink()
+        except Exception:
+            pass
+        return n
+
+
 class App:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.config = ConfigManager()
         self.history = HistoryManager(self.config)
         self.search_history = SearchHistoryManager(self.config)
+        self.search_cache = SearchCacheManager()
         self.player = PlaybackManager()
+        threading.Thread(target=get_ytdlp_module, daemon=True).start()
         self.screens = []
         self.running = True
         self.start_url = None
