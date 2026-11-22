@@ -31,11 +31,12 @@ def debug_log(msg):
     except Exception:
         pass
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 CONFIG_DIR = Path.home() / ".config" / "yt-tui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 SEARCH_HISTORY_FILE = CONFIG_DIR / "search_history.json"
+PLAYBACK_HISTORY_FILE = CONFIG_DIR / "playback_history.json"
 SEARCH_CACHE_FILE = CONFIG_DIR / "search_cache.json"
 SEARCH_CACHE_TTL = 7200  # 2 hours in seconds
 
@@ -48,6 +49,8 @@ DEFAULT_CONFIG = {
     "play_format": "bestvideo+bestaudio/best",
     "search_history_enabled": True,
     "max_search_history": 25,
+    "playback_history_enabled": True,
+    "max_playback_history": 100,
     "use_js_runtime": True,
 }
 
@@ -533,8 +536,9 @@ def get_ytdlp_module():
 class PlaybackManager:
     """Manages terminal audio/video playback with pause, stop, and live stream support."""
 
-    def __init__(self):
+    def __init__(self, on_title_resolved=None):
         self._lock = threading.Lock()
+        self._on_title_resolved = on_title_resolved
         self.state = "idle"  # idle | loading | playing | paused | error
         self.title = ""
         self.url = ""
@@ -796,6 +800,19 @@ class PlaybackManager:
                 opts["js_runtimes"] = {}
             with ydl_mod.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False) or {}
+            resolved_title = (info.get("title") or "").strip()
+            if resolved_title:
+                cb = None
+                with self._lock:
+                    if self._gen == gen and (not self.title or self.title == self.url):
+                        self.title = resolved_title
+                        self._save_state()
+                        cb = self._on_title_resolved
+                if cb:
+                    try:
+                        cb(url, resolved_title)
+                    except Exception:
+                        pass
             stream_url = info.get("url") or ""
             http_headers = info.get("http_headers") or {}
             if not stream_url:
@@ -1162,6 +1179,10 @@ class PlayOptionsScreen(Screen):
         self.draw_title("Play Media")
         h, w = self.app.stdscr.getmaxyx()
 
+        st, p_title, p_mode, p_err = self.app.player.state_snapshot()
+        if self.title == self.url and self.app.player.url == self.url and p_title and p_title != self.url:
+            self.title = p_title
+
         try:
             self.app.stdscr.attron(curses.color_pair(COLOR_INFO) | curses.A_BOLD)
             self.app.stdscr.addstr(2, 2, f"Title: {self.title[:w - 11]}")
@@ -1187,7 +1208,6 @@ class PlayOptionsScreen(Screen):
             y += 1
 
         # Player status
-        st, p_title, p_mode, p_err = self.app.player.state_snapshot()
         y += 1
         if st != "idle":
             if st == "error":
@@ -1278,6 +1298,10 @@ class PlayOptionsScreen(Screen):
                 return
             if act == "browser":
                 ok, note = play_media(self.url)
+                if ok:
+                    self.app.playback_history.add(
+                        self.url, self.title, mode="browser", fmt="Browser", output="Browser",
+                    )
                 self.msg = note if ok else f"Browser failed: {note}"
                 return
             if act == "video" and not self.has_gui:
@@ -1289,6 +1313,9 @@ class PlayOptionsScreen(Screen):
             self.app.player.start(
                 self.url, self.title, mode=act, backend=backend, device=dev,
                 output_label=lbl, fmt=fexpr, use_js_runtime=use_js,
+            )
+            self.app.playback_history.add(
+                self.url, self.title, mode=act, fmt=_flbl, output=lbl,
             )
             self.msg = f"Starting {act} ({_flbl}) on {lbl}…"
 
@@ -1345,8 +1372,10 @@ class MainMenu(Screen):
         super().__init__(app)
         self.items = [
             ("Search YouTube", "search"),
+            ("Play URL", "play_url"),
             ("Download URL", "download_url"),
             ("Batch Download (from file)", "batch"),
+            ("Playback History", "play_history"),
             ("Download History", "history"),
             ("Settings", "settings"),
             ("Exit", "exit"),
@@ -1429,10 +1458,14 @@ class MainMenu(Screen):
             action = self.items[self.idx][1]
             if action == "search":
                 self.app.push_screen(SearchInput(self.app))
+            elif action == "play_url":
+                self.app.push_screen(PlayURLInput(self.app))
             elif action == "download_url":
                 self.app.push_screen(URLInput(self.app))
             elif action == "batch":
                 self.app.push_screen(BatchDownload(self.app))
+            elif action == "play_history":
+                self.app.push_screen(PlaybackHistoryView(self.app))
             elif action == "history":
                 self.app.push_screen(HistoryView(self.app))
             elif action == "settings":
@@ -1502,6 +1535,86 @@ class URLInput(Screen):
                     self.msg = "Clipboard paste failed"
             else:
                 self.msg = "Clipboard not available (install termux-api)"
+        elif 32 <= key < 127:
+            self.url += chr(key)
+            self.msg = ""
+
+
+class PlayURLInput(Screen):
+    """Prompt for an explicit URL and open PlayOptionsScreen directly."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.url = app.start_url or ""
+        self.msg = ""
+
+    def render(self):
+        h, w = self.app.stdscr.getmaxyx()
+        self.app.stdscr.erase()
+        self.draw_title("Play URL")
+
+        if self.msg:
+            self.draw_dialog("Error", self.msg[:250])
+            self.draw_status("Press Esc to go back")
+            return
+
+        lines = [
+            "Enter or paste any video/audio URL supported by yt-dlp to play.",
+            "",
+            "URL: " + self.url + ("█" if len(self.url) < w - 10 else ""),
+        ]
+
+        for i, line in enumerate(lines):
+            try:
+                self.app.stdscr.attron(curses.color_pair(COLOR_MENU))
+                self.app.stdscr.addstr(h // 2 - 2 + i, 4, line[: w - 8])
+                self.app.stdscr.attroff(curses.color_pair(COLOR_MENU))
+            except curses.error:
+                pass
+
+        self.draw_status("Enter play options  Esc back  Ctrl+V paste  Ctrl+U clear")
+
+    @staticmethod
+    def _read_clipboard():
+        candidates = [
+            ("termux-clipboard-get", ["termux-clipboard-get"]),
+            ("wl-paste", ["wl-paste", "-n"]),
+            ("xclip", ["xclip", "-o", "-selection", "clipboard"]),
+            ("xsel", ["xsel", "-ob"]),
+        ]
+        for exe, cmd in candidates:
+            if shutil.which(exe):
+                return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=2).decode().strip(), None
+        return None, "Clipboard unavailable (need termux-clipboard-get, wl-paste, xclip, or xsel)"
+
+    def handle_key(self, key):
+        if key == 27:
+            self.app.pop_screen()
+        elif key == 21:
+            self.url = ""
+            self.msg = ""
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if self.url.strip():
+                url = normalize_url(self.url.strip())
+                debug_log(f"PlayURLInput Enter: {self.url.strip()!r} -> {url!r}")
+                self.app.push_screen(PlayOptionsScreen(self.app, {"url": url, "title": url}))
+            else:
+                self.msg = "URL cannot be empty!"
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.url = self.url[:-1]
+            self.msg = ""
+        elif key == curses.KEY_RESIZE:
+            pass
+        elif key == 22:  # Ctrl+V
+            try:
+                paste, err = self._read_clipboard()
+                if err:
+                    self.msg = err
+                elif paste:
+                    self.url += paste
+                    self.msg = ""
+            except Exception:
+                self.msg = "Clipboard paste failed"
         elif 32 <= key < 127:
             self.url += chr(key)
             self.msg = ""
@@ -2978,7 +3091,7 @@ class HistoryView(Screen):
                 pass
 
         stats = f"Total: {len(entries)} downloads"
-        self.draw_status(f"{stats}  ↑/↓ navigate  r redownload  d delete  C clear  Esc back")
+        self.draw_status(f"{stats}  ↑/↓ navigate  p play  r redownload  d delete  C clear  Esc back")
 
     def handle_key(self, key):
         entries = self.app.history.entries
@@ -2988,6 +3101,13 @@ class HistoryView(Screen):
             self.idx = max(0, self.idx - 1)
         elif key == curses.KEY_DOWN:
             self.idx = min(len(entries) - 1, self.idx + 1)
+        elif key in (ord("p"), ord("P")) and entries:
+            entry = entries[self.idx]
+            url = entry.get("url", "")
+            if url:
+                self.app.push_screen(PlayOptionsScreen(
+                    self.app, {"url": url, "title": entry.get("title") or url},
+                ))
         elif key in (ord("r"), ord("R")) and entries:
             entry = entries[self.idx]
             url = entry.get("url", "")
@@ -3001,6 +3121,151 @@ class HistoryView(Screen):
             self.app.history.clear()
             self.idx = 0
             self.msg = "History cleared"
+
+
+class PlaybackHistoryView(Screen):
+    """Displays playback history with replay, play options, delete, and clear actions."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.idx = 0
+        self.offset = 0
+        self.msg = ""
+
+    def render(self):
+        h, w = self.app.stdscr.getmaxyx()
+        self.app.stdscr.erase()
+        self.draw_title("Playback History")
+
+        entries = self.app.playback_history.entries
+        if not entries:
+            try:
+                self.app.stdscr.addstr(h // 2, 4, "No playback history yet.")
+            except curses.error:
+                pass
+            self.draw_status("Esc back")
+            return
+
+        title_w = max(20, w - 28)
+        header = f"{'#':>3}  {'Title':<{title_w}}  {'Mode':<7}  {'Date':<12}"
+        try:
+            self.app.stdscr.attron(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
+            self.app.stdscr.addstr(2, 0, header[: w - 1])
+            self.app.stdscr.attroff(curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        max_visible = max(1, h - 6)
+        if self.idx < self.offset:
+            self.offset = self.idx
+        if self.idx >= self.offset + max_visible:
+            self.offset = self.idx - max_visible + 1
+
+        for i, entry in enumerate(entries[self.offset:self.offset + max_visible]):
+            y = 3 + i
+            title = (entry.get("title") or entry.get("url") or "?")[:title_w]
+            mode = (entry.get("mode") or "audio")[:7]
+            date = fmt_time(entry.get("timestamp", ""))
+            line = f"{self.offset + i + 1:>3}  {title:<{title_w}}  {mode:<7}  {date:<12}"
+            is_sel = (self.offset + i) == self.idx
+            if is_sel:
+                attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE
+            elif i % 2 == 1:
+                attr = curses.color_pair(COLOR_MENU) | curses.A_DIM
+            else:
+                attr = curses.color_pair(COLOR_MENU)
+            try:
+                self.app.stdscr.attron(attr)
+                self.app.stdscr.addstr(y, 0, line[: w - 1])
+                self.app.stdscr.attroff(attr)
+            except curses.error:
+                pass
+
+        self.draw_scroll_indicators(self.offset, max_visible, len(entries), 3)
+        if self.msg:
+            try:
+                self.app.stdscr.attron(curses.color_pair(COLOR_INFO))
+                self.app.stdscr.addstr(h - 4, 2, f" {self.msg[:w - 4]}")
+                self.app.stdscr.attroff(curses.color_pair(COLOR_INFO))
+            except curses.error:
+                pass
+
+        stats = f"Total: {len(entries)} plays"
+        self.draw_status(f"{stats}  ↑/↓ nav  Enter/p options  r replay  d del  C clear  Esc back")
+
+    def _quick_replay(self, entry):
+        url = entry.get("url", "")
+        if not url:
+            return
+        title = entry.get("title") or url
+        req_mode = entry.get("mode") or "audio"
+        mode = "video" if (req_mode == "video" and has_graphical_display()) else "audio"
+
+        outputs = detect_audio_outputs()
+        saved_dev = self.app.config.get("audio_output", "auto") if hasattr(self.app.config, "get") else "auto"
+        lbl, backend, dev = outputs[0] if outputs else ("Default", "auto", "auto")
+        for o_lbl, o_be, o_dev in outputs:
+            if o_dev == saved_dev:
+                lbl, backend, dev = o_lbl, o_be, o_dev
+                break
+
+        saved_fmt = self.app.config.get("play_format", "") if hasattr(self.app.config, "get") else ""
+        flbl, fexpr = PLAY_QUALITY_PRESETS[0]
+        for p_lbl, p_expr in PLAY_QUALITY_PRESETS:
+            if p_expr == saved_fmt:
+                flbl, fexpr = p_lbl, p_expr
+                break
+
+        use_js = bool(self.app.config["use_js_runtime"]) if "use_js_runtime" in self.app.config.data else True
+        self.app.player.start(
+            url, title, mode=mode, backend=backend, device=dev,
+            output_label=lbl, fmt=fexpr, use_js_runtime=use_js,
+        )
+        self.app.playback_history.add(url, title, mode=mode, fmt=flbl, output=lbl)
+        self.msg = f"Replaying {mode} ({flbl}) on {lbl}…"
+
+    def handle_key(self, key):
+        entries = self.app.playback_history.entries
+        max_visible = max(1, self.app.stdscr.getmaxyx()[0] - 6)
+        if key == 27:
+            self.app.pop_screen()
+        elif key == curses.KEY_UP and entries:
+            self.idx = max(0, self.idx - 1)
+        elif key == curses.KEY_DOWN and entries:
+            self.idx = min(len(entries) - 1, self.idx + 1)
+        elif key == curses.KEY_PPAGE and entries:
+            self.idx = max(0, self.idx - max_visible)
+        elif key == curses.KEY_NPAGE and entries:
+            self.idx = min(len(entries) - 1, self.idx + max_visible)
+        elif key in (curses.KEY_ENTER, 10, 13, ord("p"), ord("P")) and entries:
+            entry = entries[self.idx]
+            url = entry.get("url", "")
+            if url:
+                self.app.push_screen(PlayOptionsScreen(
+                    self.app, {"url": url, "title": entry.get("title") or url},
+                ))
+        elif key in (ord("r"), ord("R")) and entries:
+            self._quick_replay(entries[self.idx])
+            self.idx = 0
+            self.offset = 0
+        elif key == ord(" "):
+            ok, st = self.app.player.toggle_pause()
+            self.msg = f"Playback {st}" if ok else st
+        elif key == ord("0"):
+            _ok, msg = self.app.player.restart()
+            self.msg = msg
+        elif key in (ord("s"), ord("S")):
+            self.app.player.stop()
+            self.msg = "Playback stopped."
+        elif key in (ord("d"), ord("D")) and entries:
+            self.app.playback_history.delete(self.idx)
+            self.idx = max(0, min(self.idx, len(self.app.playback_history.entries) - 1))
+            self.msg = "Entry deleted"
+        elif key == ord("C") and entries:
+            self.app.playback_history.clear()
+            self.idx = 0
+            self.offset = 0
+            self.msg = "Playback history cleared"
 
 
 class BatchDownload(Screen):
@@ -4018,6 +4283,8 @@ class SettingsView(Screen):
             ("max_history", "Max History Entries", "int"),
             ("search_history_enabled", "Search History", "bool"),
             ("max_search_history", "Max Search History Items", "int"),
+            ("playback_history_enabled", "Playback History", "bool"),
+            ("max_playback_history", "Max Playback History", "int"),
             ("use_js_runtime", "yt-dlp JS Runtime", "bool"),
             ("purge_search_cache", "Purge Search Cache (2h TTL)", "action"),
             ("theme", "Color Theme", "choice", ["dark", "light"]),
@@ -4034,7 +4301,12 @@ class SettingsView(Screen):
         self.app.stdscr.erase()
         self.draw_title("Settings")
 
+        step = 2 if (4 + len(self.fields) * 2) <= h - 6 else 1
+        start_y = 4 if step == 2 else 3
         for i, field in enumerate(self.fields):
+            row_y = start_y + i * step
+            if row_y >= h - 6:
+                break
             key, label = field[0], field[1]
             ftype = field[2] if len(field) > 2 else "text"
             val = str(self.app.config[key])
@@ -4053,7 +4325,7 @@ class SettingsView(Screen):
             attr = curses.color_pair(COLOR_SEL) | curses.A_REVERSE if i == self.idx and not self.edit_mode else curses.color_pair(COLOR_MENU)
             try:
                 self.app.stdscr.attron(attr)
-                self.app.stdscr.addstr(4 + i * 2, 2, display[: w - 4])
+                self.app.stdscr.addstr(row_y, 2, display[: w - 4])
                 self.app.stdscr.attroff(attr)
             except curses.error:
                 pass
@@ -4256,6 +4528,105 @@ class SearchHistoryManager:
         self.save()
 
 
+class PlaybackHistoryManager:
+    """Persists past played items with deduplication, title updates, and max-item limit."""
+
+    def __init__(self, config):
+        self.config = config
+        self.entries = []
+        self.load()
+
+    def load(self):
+        try:
+            if PLAYBACK_HISTORY_FILE.exists():
+                with open(PLAYBACK_HISTORY_FILE) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.entries = [e for e in data if isinstance(e, dict) and e.get("url")]
+        except (json.JSONDecodeError, OSError):
+            self.entries = []
+
+    def save(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(PLAYBACK_HISTORY_FILE, "w") as f:
+                json.dump(self.entries, f, indent=2)
+        except OSError:
+            pass
+
+    def enabled(self):
+        try:
+            return bool(self.config.data.get("playback_history_enabled", True))
+        except Exception:
+            return True
+
+    def max_items(self):
+        try:
+            return max(1, int(self.config.data.get("max_playback_history", 100)))
+        except Exception:
+            return 100
+
+    def add(self, url, title, mode="audio", fmt="", output=""):
+        raw_url = (url or "").strip()
+        if not raw_url or not self.enabled():
+            return
+        norm_url = normalize_url(raw_url)
+        existing_title = ""
+        kept = []
+        for e in self.entries:
+            e_url = e.get("url", "")
+            if e_url == norm_url or e_url == raw_url:
+                t = (e.get("title") or "").strip()
+                if t and t not in (norm_url, raw_url) and normalize_url(t) != norm_url:
+                    existing_title = t
+            else:
+                kept.append(e)
+        clean_title = (title or "").strip()
+        if (not clean_title or clean_title in (norm_url, raw_url) or normalize_url(clean_title) == norm_url) and existing_title:
+            clean_title = existing_title
+        elif normalize_url(clean_title) == norm_url:
+            clean_title = norm_url
+        entry = {
+            "url": norm_url,
+            "title": clean_title or norm_url,
+            "mode": mode or "audio",
+            "format": fmt or "",
+            "output": output or "",
+            "timestamp": datetime.now().isoformat(),
+        }
+        kept.insert(0, entry)
+        self.entries = kept[: self.max_items()]
+        self.save()
+
+    def update_title(self, url, title):
+        raw_url = (url or "").strip()
+        clean_title = (title or "").strip()
+        if not raw_url or not clean_title or clean_title == raw_url:
+            return
+        norm_url = normalize_url(raw_url)
+        if clean_title == norm_url:
+            return
+        changed = False
+        for e in self.entries:
+            e_url = e.get("url", "")
+            if e_url == norm_url or e_url == raw_url:
+                cur_title = (e.get("title") or "").strip()
+                if not cur_title or cur_title in (norm_url, raw_url, e_url) or normalize_url(cur_title) in (norm_url, e_url):
+                    e["title"] = clean_title
+                    changed = True
+        if changed:
+            self.save()
+
+    def delete(self, index):
+        if 0 <= index < len(self.entries):
+            del self.entries[index]
+            self.save()
+
+    def clear(self):
+        self.entries = []
+        self.save()
+
+
 class SearchCacheManager:
     """Caches search results on disk with a 2-hour TTL and manual purge."""
 
@@ -4343,8 +4714,9 @@ class App:
         self.config = ConfigManager()
         self.history = HistoryManager(self.config)
         self.search_history = SearchHistoryManager(self.config)
+        self.playback_history = PlaybackHistoryManager(self.config)
         self.search_cache = SearchCacheManager()
-        self.player = PlaybackManager()
+        self.player = PlaybackManager(on_title_resolved=self.playback_history.update_title)
         threading.Thread(target=get_ytdlp_module, daemon=True).start()
         self.screens = []
         self.running = True

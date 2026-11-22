@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.3.0 (2026-11-22)
+
+### Features
+
+- **Explicit URL Playback (`Play URL`):** Added a `Play URL` entry on the main menu (`PlayURLInput`) to paste/enter any URL supported by `yt-dlp` and jump directly to `PlayOptionsScreen` (`music.youtube.com` URLs auto-normalized; supports `termux-clipboard-get`, `wl-paste`, `xclip`, and `xsel` for `Ctrl+V` paste).
+- **Playback History (`Playback History`):** Added `PlaybackHistoryManager` (`~/.config/yt-tui/playback_history.json`) and `PlaybackHistoryView` with automatic deduplication, lazy title resolution when playing raw URLs, `Enter`/`p` for Play Options, `r` quick replay, `d` delete, `C` clear, and `Space`/`0`/`s` playback controls.
+- **Play from Download History:** Pressing `p` in `HistoryView` now opens `PlayOptionsScreen` for that entry.
+- **Settings:** Added **Playback History** (`on`/`off`) and **Max Playback History** configuration options (with adaptive row spacing on smaller terminals).
+
+## v1.2.1 (2026-11-22)
+
+### Features
+
+- **Output Volume Keybindings:** Added `+`/`=` and `-`/`_` in `PlayOptionsScreen` (`adjust_output_volume`) supporting PipeWire/PulseAudio (`pactl`), BlueALSA (`bluealsa-cli`), and ALSA (`amixer`).
+
+### Bug Fixes
+
+- **Default ALSA Output Detection:** Included `Default (ALSA)` (`default`) on non-Pulse/PipeWire setups so shared `dmix` configurations aren't bypassed by `sysdefault:CARD=...`.
+- **Headless Stream Playback (`ffmpeg`):** Removed the `android_vr,ios` client override when JS runtime is off (fixing HTTP 403 errors), forwarded `http_headers` (`-user_agent`/`-headers`) to `ffmpeg`, and reported `ffmpeg` stderr errors instead of silently returning to idle.
+- **PipeWire/Pulse `ffmpeg` Sink Selection:** Passed `--device` (`paplay`) or `PULSE_SINK` (`aplay`) when `backend == "pulse"`.
+- **Version Header Display:** Showed `APP_VERSION` consistently instead of hardcoded `v1.0`.
+
 ## v1.2.0 (2026-11-20)
 
 ### Features
