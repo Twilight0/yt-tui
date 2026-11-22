@@ -14,6 +14,10 @@
 ### Features
 
 - **Output Volume Keybindings:** Added `+`/`=` and `-`/`_` in `PlayOptionsScreen` (`adjust_output_volume`) supporting PipeWire/PulseAudio (`pactl`), BlueALSA (`bluealsa-cli`), and ALSA (`amixer`).
+- **JS Runtime Toggle (`use_js_runtime`):** Toggle `yt-dlp` JavaScript runtime usage on/off from Settings (`--no-js-runtimes` / `js_runtimes = {}`).
+- **Search Cache (`SearchCacheManager`):** Caches search results on disk with a 2-hour TTL, with a **Purge Search Cache** action in Settings.
+- **In-Process `yt_dlp` Extraction:** Imports and warms up `yt_dlp` in-process (`get_ytdlp_module()` / `_fetch_in_process()`) for faster search and stream URL extraction.
+- **Settings Folder Picker:** Selecting **Default Download Directory** in Settings now opens `FolderBrowser` interactively.
 
 ### Bug Fixes
 
